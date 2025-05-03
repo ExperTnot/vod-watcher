@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+...
+
+# Custom additions
+vodenv/
+venv/
+.env
+checkme.txt

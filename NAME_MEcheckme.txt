@@ -1,0 +1,4 @@
+# platform , channel_or_id , keyword
+# youtube channels can be username, @handle or channel ID
+twitch,xxx,drama
+youtube,yyy,gaming  
