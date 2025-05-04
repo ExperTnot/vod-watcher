@@ -117,16 +117,39 @@ class ChannelTask:
         _spawn_count[self.platform] += 1
         self.next_probe = time.time() + idx * PLATFORM_COOLDOWN
         self.loop: Optional[asyncio.Task] = None
+        self.current_vod_fp: Optional[Path] = None
 
     def start(self):
         self.loop = asyncio.create_task(self._poll_loop())
 
-    async def stop(self):
+    async def stop(self, abort_recording: bool = False):
+        logger.debug(f"stop() called on {self.platform}::{self.name} – abort_recording={abort_recording}")
         if self.loop:
             self.loop.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.loop
-        await self._stop_recording()
+        if abort_recording:
+            if self.proc:
+                try:
+                    self.proc.kill()
+                except Exception as e:
+                    logger.warning(f"Failed to kill process for {self.name}: {e}")
+                else:
+                    logger.info(f"ABORT {self.platform}::{self.name}")
+
+            vod_fp = self.current_vod_fp
+            if vod_fp and vod_fp.exists():
+                try:
+                    vod_fp.unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to delete {vod_fp}: {e}")
+                else:
+                    logger.info(f"Deleted partial VOD {vod_fp.name}")
+        else:
+            await self._stop_recording()
+
+        self.proc = None
+        self.current_vod_fp = None
 
     def is_recording(self) -> bool:
         return bool(self.proc and self.proc.poll() is None)
@@ -224,14 +247,16 @@ class ChannelTask:
 
     def _paths(self, title: str) -> Tuple[Path,Path]:
         title = strip_end_date_time(title)
-        safe  = re.sub(r"[^\w\s.\-]+", "_", title)[:120].strip() or "live"
-        day   = dt.datetime.now().strftime("%Y-%m-%d")
+        safe_raw = title.strip()
+        safe = "".join(ch if ch not in (os.sep, "\0") else "_" for ch in safe_raw)
+        safe = safe[:150].strip() or "live"
+        day = dt.datetime.now().strftime("%Y-%m-%d")
         vod_dir = VOD_ROOT / self.name
         log_dir = LOG_ROOT / self.name
         vod_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        base = vod_dir / f"{day}_{safe}"
+        base = vod_dir / f"{day} {safe}"
         idx  = 1
         vod  = base.with_suffix(".mp4")
         while vod.exists():
@@ -242,6 +267,7 @@ class ChannelTask:
 
     async def _start_recording(self, title: str):
         vod_fp, log_fp = self._paths(title)
+        self.current_vod_fp = vod_fp
         if self.platform == "youtube":
             url = yt_live_url(self.name)
             cmd = [
@@ -285,7 +311,7 @@ class Supervisor:
         self.dash_task   = asyncio.create_task(self._dashboard_loop())
         await self.stop_evt.wait()
 
-    async def shutdown(self):
+    async def shutdown(self, finish_recordings: bool = False):
         logger.info("Shutting down supervisor…")
         self.stop_evt.set()
         for t in (self.reload_task, self.dash_task):
@@ -295,7 +321,13 @@ class Supervisor:
                 *(t for t in (self.reload_task, self.dash_task) if t),
                 return_exceptions=True
             )
-        await asyncio.gather(*(task.stop() for task in self.tasks.values()), return_exceptions=True)
+        await asyncio.gather(
+            *(
+                task.stop(abort_recording=not finish_recordings)
+                for task in self.tasks.values()
+            ),
+            return_exceptions=True
+        )
 
     async def _reload_loop(self):
         await self._load_watchlist()
@@ -371,7 +403,9 @@ def main():
         loop.run_until_complete(sup.run())
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
-        loop.run_until_complete(sup.shutdown())
+        ans = input("Exit requested. Let ongoing recordings finish? [y/n]: ").strip().lower()
+        abort = (ans == "y")
+        loop.run_until_complete(sup.shutdown(finish_recordings=abort))
     finally:
         loop.close()
         logger.info("Exited cleanly")
