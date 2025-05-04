@@ -25,6 +25,7 @@ CHECK_FILE         = Path.home() / "code" / "vod_watch" / "checkme.txt"
 VOD_ROOT           = Path("/mnt/media/VODs/processed")
 LOG_ROOT           = Path("/mnt/media/logs/processed")
 SCRIPT_DIR         = Path(__file__).parent.resolve()
+DETACHED_FILE      = SCRIPT_DIR / ".detached.json"
 LOG_DIR            = SCRIPT_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 MAIN_LOG           = LOG_DIR / "vod_watcher.log"
@@ -38,9 +39,9 @@ CLEAR_CMD          = "clear" if os.getenv("TERM") else "cls"
 # ───── color setup ───── #
 USE_COLOR = sys.stdout.isatty() and ("TERM" in os.environ)
 if USE_COLOR:
-    RED, YELLOW, GREEN, RESET = "\033[91m", "\033[93m", "\033[92m", "\033[0m"
+    RED, YELLOW, GREEN, BLUE, RESET = "\033[91m", "\033[93m", "\033[92m", "\033[94m", "\033[0m"
 else:
-    RED = YELLOW = GREEN = RESET = ""
+    RED = YELLOW = GREEN = BLUE = RESET = ""
 
 DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}$")
 
@@ -112,12 +113,15 @@ class ChannelTask:
         self.current_title: str = "<awaiting check>"
         self.live_raw: Optional[bool] = None
         self.keyword_ok: bool = False
+        self.last_logged_title: Optional[str] = None
 
         idx = _spawn_count[self.platform]
         _spawn_count[self.platform] += 1
         self.next_probe = time.time() + idx * PLATFORM_COOLDOWN
         self.loop: Optional[asyncio.Task] = None
         self.current_vod_fp: Optional[Path] = None
+        self.detached_pid: Optional[int] = None
+        self._load_detached()
 
     def start(self):
         self.loop = asyncio.create_task(self._poll_loop())
@@ -151,8 +155,38 @@ class ChannelTask:
         self.proc = None
         self.current_vod_fp = None
 
+    def _load_detached(self):
+        """Reattach to a detached recording from DETACHED_FILE."""
+        if DETACHED_FILE.exists():
+            try:
+                data = json.loads(DETACHED_FILE.read_text())
+                key = f"{self.platform}::{self.name.lower()}"
+                pid = data.get(key)
+                if pid:
+                    os.kill(pid, 0)       # still alive?
+                    self.detached_pid = pid
+                else:
+                    self.detached_pid = None
+            except Exception:
+                # stale entry: remove and ignore
+                try:
+                    data.pop(key, None)
+                    DETACHED_FILE.write_text(json.dumps(data))
+                except:
+                    pass
+                self.detached_pid = None
+
     def is_recording(self) -> bool:
-        return bool(self.proc and self.proc.poll() is None)
+        # live if either our child process is running, or a detached pid persists
+        alive_child = bool(self.proc and self.proc.poll() is None)
+        alive_detach = False
+        if self.detached_pid:
+            try:
+                os.kill(self.detached_pid, 0)
+                alive_detach = True
+            except OSError:
+                self.detached_pid = None
+        return alive_child or alive_detach
 
     async def _poll_loop(self):
         while True:
@@ -185,6 +219,16 @@ class ChannelTask:
                 elif (not live or not ok) and self.is_recording():
                     await self._stop_recording()
 
+                if live and self.current_title and self.current_title != self.last_logged_title:
+                    logdir = LOG_ROOT / self.name
+                    logdir.mkdir(parents=True, exist_ok=True)
+                    now = dt.datetime.now().isoformat()
+                    with (logdir / "stream_titles.log").open("a", encoding="utf-8") as fh:
+                        fh.write(f"{now} {self.current_title}\n")
+                    self.last_logged_title = self.current_title
+                elif not live and self.last_logged_title is not None:
+                    self.last_logged_title = None
+
             except Exception:
                 logger.exception(f"{self.platform}::{self.name} probe failure")
             await asyncio.sleep(interval)
@@ -206,13 +250,6 @@ class ChannelTask:
             stderr=asyncio.subprocess.DEVNULL
         )
         raw, _ = await proc.communicate()
-
-        # log to per-channel probe.log
-        now = dt.datetime.now().isoformat()
-        logdir = LOG_ROOT / self.name
-        logdir.mkdir(parents=True, exist_ok=True)
-        with (logdir / "probe.log").open("a", encoding="utf-8") as fh:
-            fh.write(f"{now} | {raw.decode(errors='replace').rstrip()}\n")
 
         if not raw:
             return False, False, ""
@@ -285,7 +322,9 @@ class ChannelTask:
         logger.info(f"START {self.platform}::{self.name} → {vod_fp.name}")
         logf = open(log_fp, "a", buffering=1, encoding="utf-8")
         logf.write(f"{dt.datetime.now().isoformat()} START {title}\n")
-        self.proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, text=True)
+        self.proc = subprocess.Popen(
+            cmd, stdout=logf, stderr=logf, text=True, preexec_fn=os.setsid
+        )
 
     async def _stop_recording(self):
         if self.proc and self.proc.poll() is None:
@@ -326,6 +365,34 @@ class Supervisor:
                 task.stop(abort_recording=not finish_recordings)
                 for task in self.tasks.values()
             ),
+            return_exceptions=True
+        )
+        to_stop = []
+        for task in self.tasks.values():
+            if finish_recordings and task.is_recording():
+                # record its pid for next run
+                pid = None
+                if task.proc and task.proc.poll() is None:
+                    pid = task.proc.pid
+                elif task.detached_pid:
+                    pid = task.detached_pid
+                if pid:
+                    # load existing, update central JSON
+                    data = {}
+                    if DETACHED_FILE.exists():
+                        try:
+                            data = json.loads(DETACHED_FILE.read_text())
+                        except:
+                            data = {}
+                    key = f"{task.platform}::{task.name.lower()}"
+                    data[key] = pid
+                    DETACHED_FILE.write_text(json.dumps(data))
+                    task.detached_pid = pid
+            else:
+                to_stop.append(task)
+        # stop & kill any tasks not detached
+        await asyncio.gather(
+            *(t.stop(abort_recording=True) for t in to_stop),
             return_exceptions=True
         )
 

@@ -10,3 +10,4 @@ venv/
 .env
 checkme.txt
 logs/*
+.detached.json
