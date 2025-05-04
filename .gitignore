@@ -9,3 +9,4 @@ vodenv/
 venv/
 .env
 checkme.txt
+logs/*
