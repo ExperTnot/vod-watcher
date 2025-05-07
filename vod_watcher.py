@@ -156,12 +156,14 @@ class ChannelTask:
             )
         return
 
-    async def stop(self, abort_recording: bool = False):
+    async def stop(self, abort_recording: bool = False, delete_partials: bool = True):
         """Stop the channel monitoring task and optionally abort recording.
 
         Args:
             abort_recording: If True, also stops any active recording process.
                 If False, allows recording to continue running.
+            delete_partials: If True, deletes partial VOD files when stopping recordings.
+                If False, preserves partial VOD files even when stopping recordings.
         """
         logger.debug(
             f"stop() called on {self.platform}::{self.name} – abort_recording={abort_recording}"
@@ -241,14 +243,19 @@ class ChannelTask:
             if process_was_running_and_killed_by_this_abort:
                 vod_fp = self.current_vod_fp
                 if vod_fp and vod_fp.exists():
-                    try:
-                        vod_fp.unlink()
+                    if delete_partials:
+                        try:
+                            vod_fp.unlink()
+                            logger.info(
+                                f"Deleted VOD {vod_fp.name} because recording was aborted."
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to delete VOD file {vod_fp} after abort: {e}"
+                            )
+                    else:
                         logger.info(
-                            f"Deleted VOD {vod_fp.name} because recording was aborted."
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to delete VOD file {vod_fp} after abort: {e}"
+                            f"Kept partial VOD {vod_fp.name} as requested."
                         )
                 elif vod_fp:
                     logger.info(
@@ -652,15 +659,17 @@ class Supervisor:
         self.dash_task = asyncio.create_task(self._dashboard_loop())
         await self.stop_evt.wait()
 
-    async def shutdown(self, finish_recordings: bool = False):
+    async def shutdown(self, finish_recordings: bool = False, delete_partials: bool = True):
         """Gracefully shut down the supervisor and all managed tasks.
 
         Cancels the reload and dashboard tasks, then handles all channel tasks
-        according to the finish_recordings parameter.
+        according to the finish_recordings and delete_partials parameters.
 
         Args:
             finish_recordings: If True, allows active recordings to continue in
                 the background. If False, stops all recordings.
+            delete_partials: If True, deletes partial VOD files when stopping recordings.
+                If False, preserves partial VOD files even when stopping recordings.
         """
         logger.info("Shutting down supervisor…")
         self.stop_evt.set()
@@ -682,7 +691,7 @@ class Supervisor:
             logger.info("No channels are currently recording")
             # Stop all tasks before exiting
             await asyncio.gather(
-                *(task.stop(abort_recording=True) for task in self.tasks.values()),
+                *(task.stop(abort_recording=True, delete_partials=delete_partials) for task in self.tasks.values()),
                 return_exceptions=True,
             )
             return
@@ -713,7 +722,7 @@ class Supervisor:
 
         # Stop tasks that shouldn't continue recording
         await asyncio.gather(
-            *(task.stop(abort_recording=True) for task in to_stop),
+            *(task.stop(abort_recording=True, delete_partials=delete_partials) for task in to_stop),
             return_exceptions=True,
         )
 
@@ -922,12 +931,22 @@ def main():
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
         ans = (
-            input("Exit requested. Let ongoing recordings finish? [y/n]: ")
+            input("Exit requested. Let ongoing recordings finish? [Y/n] (default: Y): ")
             .strip()
             .lower()
         )
-        finish = ans == "y"
-        loop.run_until_complete(sup.shutdown(finish_recordings=finish))
+        finish = ans == "" or ans == "y"
+        
+        delete_partials = False
+        if not finish:
+            ans_delete = (
+                input("Delete partial VOD recordings? [Y/n] (default: N): ")
+                .strip()
+                .lower()
+            )
+            delete_partials = ans_delete == "y"
+        
+        loop.run_until_complete(sup.shutdown(finish_recordings=finish, delete_partials=delete_partials))
     finally:
         loop.close()
         logger.info("Exited cleanly")

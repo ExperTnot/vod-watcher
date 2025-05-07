@@ -165,7 +165,7 @@ async def send_discord_notification(platform: str, channel_name: str, title: str
     now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     embed = {
-        "title": f"🔴 {channel_name}",
+        "title": f"{"🔴" if platform.lower() == 'youtube' else "🟣"} {channel_name}",
         "description": title,
         "fields": [
             {"name": "Platform", "value": platform.capitalize(), "inline": True},
