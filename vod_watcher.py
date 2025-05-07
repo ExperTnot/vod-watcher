@@ -17,7 +17,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from env import DISCORD_WEBHOOK_URL
 
+import aiohttp # Added for Discord webhook
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 # ───── configuration ───── #
@@ -88,12 +90,10 @@ def strip_end_date_time(text: str) -> str:
 logger = logging.getLogger("vod_watcher")
 logger.setLevel(logging.INFO)
 
-# console handler
 ch = logging.StreamHandler()
 ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logger.addHandler(ch)
 
-# rotating file handler
 file_handler = logging.handlers.RotatingFileHandler(
     str(MAIN_LOG),
     maxBytes=5_000_000,
@@ -101,6 +101,33 @@ file_handler = logging.handlers.RotatingFileHandler(
 )
 file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 logger.addHandler(file_handler)
+
+
+async def send_discord_notification(platform: str, channel_name: str, title: str):
+    if not DISCORD_WEBHOOK_URL:
+        logger.debug("Discord webhook URL not set, skipping notification.")
+        return
+
+    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    message_content = (
+        f"🔴 Recording Started!\n"
+        f"**Date**: {now_str}\n"
+        f"**Platform**: {platform.capitalize()}\n"
+        f"**Channel**: {channel_name}\n"
+        f"**Title**: {title}"
+    )
+    payload = {"content": message_content}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(DISCORD_WEBHOOK_URL, json=payload) as response:
+                if response.status >= 200 and response.status < 300:
+                    logger.debug(f"Discord notification sent for {channel_name}")
+                else:
+                    logger.warning(f"Failed to send Discord notification for {channel_name}: {response.status} {await response.text()}")
+    except Exception as e:
+        logger.error(f"Error sending Discord notification for {channel_name}: {e}")
+
 
 # ───── ChannelTask ───── #
 class ChannelTask:
@@ -133,22 +160,28 @@ class ChannelTask:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.loop
         if abort_recording:
-            if self.proc:
-                try:
-                    self.proc.kill()
-                except Exception as e:
-                    logger.warning(f"Failed to kill process for {self.name}: {e}")
+            process_was_running_and_killed_by_this_abort = False
+            if self.proc:  # Check if a process object exists
+                if self.proc.poll() is None:  # Check if the process is currently running
+                    try:
+                        self.proc.kill()  # Attempt to kill it
+                        process_was_running_and_killed_by_this_abort = True  # Mark that we killed an active process
+                        logger.info(f"ABORT {self.platform}::{self.name} (process killed during abort)")
+                    except Exception as e:
+                        logger.warning(f"Failed to kill running process for {self.name} during abort: {e}")
                 else:
-                    logger.info(f"ABORT {self.platform}::{self.name}")
+                    logger.info(f"Process for {self.platform}::{self.name} had already terminated (exit code: {self.proc.poll()}) before abort action. VOD will not be deleted by this action.")
 
-            vod_fp = self.current_vod_fp
-            if vod_fp and vod_fp.exists():
-                try:
-                    vod_fp.unlink()
-                except Exception as e:
-                    logger.warning(f"Failed to delete {vod_fp}: {e}")
-                else:
-                    logger.info(f"Deleted partial VOD {vod_fp.name}")
+            if process_was_running_and_killed_by_this_abort:
+                vod_fp = self.current_vod_fp
+                if vod_fp and vod_fp.exists():
+                    try:
+                        vod_fp.unlink()
+                        logger.info(f"Deleted VOD {vod_fp.name} because recording was aborted.")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete VOD file {vod_fp} after abort: {e}")
+                elif vod_fp:
+                    logger.info(f"VOD file {vod_fp.name} for aborted recording was not found.")
         else:
             await self._stop_recording()
 
@@ -156,19 +189,17 @@ class ChannelTask:
         self.current_vod_fp = None
 
     def _load_detached(self):
-        """Reattach to a detached recording from DETACHED_FILE."""
         if DETACHED_FILE.exists():
             try:
                 data = json.loads(DETACHED_FILE.read_text())
                 key = f"{self.platform}::{self.name.lower()}"
                 pid = data.get(key)
                 if pid:
-                    os.kill(pid, 0)       # still alive?
+                    os.kill(pid, 0)
                     self.detached_pid = pid
                 else:
                     self.detached_pid = None
             except Exception:
-                # stale entry: remove and ignore
                 try:
                     data.pop(key, None)
                     DETACHED_FILE.write_text(json.dumps(data))
@@ -177,7 +208,6 @@ class ChannelTask:
                 self.detached_pid = None
 
     def is_recording(self) -> bool:
-        # live if either our child process is running, or a detached pid persists
         alive_child = bool(self.proc and self.proc.poll() is None)
         alive_detach = False
         if self.detached_pid:
@@ -305,6 +335,10 @@ class ChannelTask:
     async def _start_recording(self, title: str):
         vod_fp, log_fp = self._paths(title)
         self.current_vod_fp = vod_fp
+
+        # Send Discord notification
+        asyncio.create_task(send_discord_notification(self.platform, self.name, title))
+
         if self.platform == "youtube":
             url = yt_live_url(self.name)
             cmd = [
@@ -319,12 +353,21 @@ class ChannelTask:
                 "--twitch-disable-hosting", "--twitch-disable-ads",
                 "-o", str(vod_fp)
             ]
+        
         logger.info(f"START {self.platform}::{self.name} → {vod_fp.name}")
-        logf = open(log_fp, "a", buffering=1, encoding="utf-8")
-        logf.write(f"{dt.datetime.now().isoformat()} START {title}\n")
+        
+        # Write a minimal start message to the specific stream log
+        try:
+            with open(log_fp, "a", encoding="utf-8") as lf:
+                lf.write(f"{dt.datetime.now().isoformat()} START {title} for {self.platform}::{self.name} on VOD file {vod_fp.name}\n")
+        except Exception as e:
+            logger.error(f"Failed to write to stream log {log_fp}: {e}")
+
+        # Redirect yt-dlp/streamlink stdout/stderr to DEVNULL to prevent large log files
         self.proc = subprocess.Popen(
-            cmd, stdout=logf, stderr=logf, text=True, preexec_fn=os.setsid
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=False, preexec_fn=os.setsid
         )
+
 
     async def _stop_recording(self):
         if self.proc and self.proc.poll() is None:
@@ -370,14 +413,12 @@ class Supervisor:
         to_stop = []
         for task in self.tasks.values():
             if finish_recordings and task.is_recording():
-                # record its pid for next run
                 pid = None
                 if task.proc and task.proc.poll() is None:
                     pid = task.proc.pid
                 elif task.detached_pid:
                     pid = task.detached_pid
                 if pid:
-                    # load existing, update central JSON
                     data = {}
                     if DETACHED_FILE.exists():
                         try:
@@ -390,7 +431,6 @@ class Supervisor:
                     task.detached_pid = pid
             else:
                 to_stop.append(task)
-        # stop & kill any tasks not detached
         await asyncio.gather(
             *(t.stop(abort_recording=True) for t in to_stop),
             return_exceptions=True
@@ -452,7 +492,7 @@ class Supervisor:
                     elif not t.keyword_ok:
                         colour, state = YELLOW, "LIVE"
                     else:
-                        colour, state = YELLOW, "LIVE"
+                        colour, state = YELLOW, "LIVE" # Was LIVE/KW_MISS, changed to just LIVE if keyword_ok is true but not recording yet
                 else:
                     colour, state = RED, "OFF"
 
@@ -471,8 +511,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
         ans = input("Exit requested. Let ongoing recordings finish? [y/n]: ").strip().lower()
-        abort = (ans == "y")
-        loop.run_until_complete(sup.shutdown(finish_recordings=abort))
+        finish = (ans == "y") # Corrected variable name for clarity
+        loop.run_until_complete(sup.shutdown(finish_recordings=finish))
     finally:
         loop.close()
         logger.info("Exited cleanly")
