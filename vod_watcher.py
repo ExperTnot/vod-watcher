@@ -13,12 +13,17 @@ import logging
 import logging.handlers
 import os
 import platform
-import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 # Check if running on Linux
 if platform.system() != "Linux":
@@ -32,17 +37,18 @@ from env import (
     RELOAD_INTERVAL,
     PROBE_INTERVAL,
     PLATFORM_COOLDOWN,
-    YOUTUBE_API_KEY,
-    TWITCH_CLIENT_ID,
-    TWITCH_CLIENT_SECRET,
 )
-import aiohttp
-from tenacity import (
-    AsyncRetrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
+from api import send_discord_notification
+from verifications import verify_paths
+from utils import (
+    _spawn_count,
+    _platform_counts,
+    platform_interval,
+    wait_for_platform_slot,
+    yt_live_url,
+    strip_end_date_time,
 )
+
 
 # ───── configuration ───── #
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -56,10 +62,9 @@ MAIN_LOG = LOG_DIR / "vod_watcher.log"
 RELOAD_INTERVAL = max(60, RELOAD_INTERVAL)
 PROBE_INTERVAL = max(60, PROBE_INTERVAL)
 PLATFORM_COOLDOWN = max(30, PLATFORM_COOLDOWN)
-DASH_FPS = 1
 MAX_YT_HEIGHT = 1080
 
-# ───── color setup ───── #
+# ───── color and terminal setup ───── #
 USE_COLOR = sys.stdout.isatty() and ("TERM" in os.environ)
 if USE_COLOR:
     RED, YELLOW, GREEN, BLUE, RESET = (
@@ -72,51 +77,10 @@ if USE_COLOR:
 else:
     RED = YELLOW = GREEN = BLUE = RESET = ""
 
-DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}$")
+CURSOR_HOME = "\033[H" # Move cursor to top left
+ERASE_DOWN = "\033[J" # Erase from cursor to end of screen
 
-# ───── shared cooldown state ───── #
-_last_probe_time: Dict[str, float] = {"youtube": 0.0, "twitch": 0.0}
-_platform_locks: Dict[str, asyncio.Lock] = {
-    "youtube": asyncio.Lock(),
-    "twitch": asyncio.Lock(),
-}
-_spawn_count: Dict[str, int] = {"youtube": 0, "twitch": 0}
-_platform_counts: Dict[str, int] = {"youtube": 1, "twitch": 1}
-
-
-def platform_interval(platform: str) -> int:
-    n = max(1, _platform_counts.get(platform, 1))
-    return max(PROBE_INTERVAL, PLATFORM_COOLDOWN * n)
-
-
-async def wait_for_platform_slot(platform: str) -> float:
-    lock = _platform_locks[platform]
-    async with lock:
-        now = time.time()
-        scheduled = max(now, _last_probe_time[platform] + PLATFORM_COOLDOWN)
-        _last_probe_time[platform] = scheduled
-        if scheduled > now:
-            await asyncio.sleep(scheduled - now)
-        return scheduled
-
-
-def yt_live_url(name: str) -> str:
-    name = name.strip()
-    if name.startswith("@"):
-        path = name
-    elif re.match(r"UC[A-Za-z0-9_-]{22}", name):
-        path = f"channel/{name}"
-    else:
-        path = f"@{name}"
-    return f"https://www.youtube.com/{path}/live"
-
-
-def strip_end_date_time(text: str) -> str:
-    parts = text.rstrip().split()
-    if len(parts) >= 2 and DATE_RE.fullmatch(parts[-2]):
-        return " ".join(parts[:-2]).rstrip(" -_/")
-    return text
-
+DASH_FPS = 2
 
 # ───── logging setup ───── #
 logger = logging.getLogger("vod_watcher")
@@ -137,156 +101,16 @@ file_handler.setFormatter(
 logger.addHandler(file_handler)
 
 
-async def get_twitch_access_token() -> Optional[str]:
-    """Get an OAuth token for the Twitch API."""
-    if (
-        not TWITCH_CLIENT_ID
-        or not TWITCH_CLIENT_SECRET
-        or TWITCH_CLIENT_ID.strip() == ""
-        or TWITCH_CLIENT_SECRET.strip() == ""
-    ):
-        logger.debug("Twitch client credentials not set, skipping thumbnail fetch.")
-        return None
-
-    try:
-        params = {
-            "client_id": TWITCH_CLIENT_ID,
-            "client_secret": TWITCH_CLIENT_SECRET,
-            "grant_type": "client_credentials",
-        }
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://id.twitch.tv/oauth2/token", params=params
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get("access_token")
-                else:
-                    logger.warning(
-                        f"Failed to get Twitch access token: {response.status}"
-                    )
-    except Exception as e:
-        logger.error(f"Error getting Twitch access token: {e}")
-
-    return None
-
-
-async def get_twitch_channel_thumbnail(channel_name: str) -> Optional[str]:
-    """Fetch the Twitch channel's profile image URL using the Twitch API."""
-    access_token = await get_twitch_access_token()
-    if not access_token:
-        return None
-
-    headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {access_token}"}
-
-    params = {"login": channel_name}
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.twitch.tv/helix/users", headers=headers, params=params
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get("data") and len(data["data"]) > 0:
-                        return data["data"][0].get("profile_image_url")
-                else:
-                    logger.warning(
-                        f"Failed to fetch Twitch channel thumbnail for {channel_name}: {response.status}"
-                    )
-    except Exception as e:
-        logger.error(f"Error fetching Twitch channel thumbnail for {channel_name}: {e}")
-    return None
-
-
-async def get_youtube_channel_thumbnail(channel_name: str) -> Optional[str]:
-    """Fetch the YouTube channel's thumbnail URL using the YouTube API."""
-    if not YOUTUBE_API_KEY or YOUTUBE_API_KEY.strip() == "":
-        logger.debug("YouTube API key not set, skipping thumbnail fetch.")
-        return None
-
-    username = channel_name[1:] if channel_name.startswith("@") else channel_name
-
-    params = {"part": "snippet", "forHandle": username, "key": YOUTUBE_API_KEY}
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://www.googleapis.com/youtube/v3/channels", params=params
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get("items") and len(data["items"]) > 0:
-                        item = data["items"][0]
-                        if "snippet" in item and "thumbnails" in item["snippet"]:
-                            return (
-                                item["snippet"]["thumbnails"]
-                                .get("medium", {})
-                                .get("url")
-                            )
-                else:
-                    logger.warning(
-                        f"Failed to fetch YouTube channel thumbnail for {channel_name}: {response.status}"
-                    )
-    except Exception as e:
-        logger.error(
-            f"Error fetching YouTube channel thumbnail for {channel_name}: {e}"
-        )
-    return None
-
-
-async def send_discord_notification(platform: str, channel_name: str, title: str):
-    # Log the notification in console for user feedback even if webhook isn't available
-    logger.info(f"Recording started: {platform.capitalize()}/{channel_name} - {title}")
-
-    if not DISCORD_WEBHOOK_URL:
-        logger.debug("Discord webhook URL not set, skipping webhook notification.")
-        return
-
-    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    embed = {
-        "title": f"🔴 {channel_name}",
-        "description": title,
-        "fields": [
-            {"name": "Platform", "value": platform.capitalize(), "inline": True},
-            {"name": "Date", "value": now_str, "inline": True},
-        ],
-        "timestamp": dt.datetime.now().isoformat(),
-    }
-
-    # Get profile image based on platform type
-    thumbnail_url = None
-    if platform.lower() == "youtube":
-        thumbnail_url = await get_youtube_channel_thumbnail(channel_name)
-        if thumbnail_url:
-            logger.debug(f"Added thumbnail for YouTube channel {channel_name}")
-    elif platform.lower() == "twitch":
-        thumbnail_url = await get_twitch_channel_thumbnail(channel_name)
-        if thumbnail_url:
-            logger.debug(f"Added thumbnail for Twitch channel {channel_name}")
-
-    if thumbnail_url:
-        embed["thumbnail"] = {"url": thumbnail_url}
-
-    payload = {"embeds": [embed]}
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(DISCORD_WEBHOOK_URL, json=payload) as response:
-                if response.status >= 200 and response.status < 300:
-                    logger.debug(f"Discord notification sent for {channel_name}")
-                else:
-                    logger.warning(
-                        f"Failed to send Discord notification for {channel_name}: {response.status} {await response.text()}"
-                    )
-    except Exception as e:
-        logger.error(f"Error sending Discord notification for {channel_name}: {e}")
-
-
 # ───── ChannelTask ───── #
 class ChannelTask:
+    """Manages monitoring and recording for a single streaming channel.
+
+    This class is responsible for periodically checking if a channel is live,
+    matching against keywords, and starting/stopping recordings as needed.
+    It handles both YouTube and Twitch channels and manages the lifecycle
+    of recording processes including detachment during shutdown.
+    """
+
     def __init__(self, platform: str, name: str, keyword: str):
         self.platform = platform.lower().strip()
         self.name = name.strip()
@@ -307,11 +131,20 @@ class ChannelTask:
         self._load_detached()
 
     def start(self):
+        """Start the channel monitoring task.
+
+        Creates an asyncio task that periodically checks if the channel is live
+        and handles recording start/stop based on live status and keywords.
+        """
         self.loop = asyncio.create_task(self._poll_loop())
 
     async def _stop_task_loop(self):
         """Stop only the task loop without stopping the recording process.
-        This is used when detaching processes during shutdown.
+
+        This is used when detaching processes during shutdown to allow recordings
+        to continue even after the monitoring has stopped.
+
+        The recording process will continue running in the background.
         """
         if self.loop:
             self.loop.cancel()
@@ -324,6 +157,12 @@ class ChannelTask:
         return
 
     async def stop(self, abort_recording: bool = False):
+        """Stop the channel monitoring task and optionally abort recording.
+
+        Args:
+            abort_recording: If True, also stops any active recording process.
+                If False, allows recording to continue running.
+        """
         logger.debug(
             f"stop() called on {self.platform}::{self.name} – abort_recording={abort_recording}"
         )
@@ -422,6 +261,12 @@ class ChannelTask:
         self.current_vod_fp = None
 
     def _load_detached(self):
+        """Load information about previously detached recording processes.
+
+        Reads the detached process state file to check if this channel has a
+        recording process that was detached during a previous run. If found,
+        it verifies if the process is still running and updates the task state accordingly.
+        """
         if DETACHED_FILE.exists():
             try:
                 data = json.loads(DETACHED_FILE.read_text())
@@ -471,6 +316,14 @@ class ChannelTask:
                 self.detached_data = None
 
     def is_recording(self) -> bool:
+        """Check if the channel is currently being recorded.
+
+        Verifies if either an active recording process is running or a detached
+        process is still alive.
+
+        Returns:
+            bool: True if recording is active, False otherwise
+        """
         alive_child = bool(self.proc and self.proc.poll() is None)
         alive_detach = False
         if self.detached_pid:
@@ -482,6 +335,14 @@ class ChannelTask:
         return alive_child or alive_detach
 
     async def _poll_loop(self):
+        """Main monitoring loop that periodically checks if the channel is live.
+
+        This method runs in a continuous loop, respecting rate limits, and:
+        1. Checks if the channel is live with _probe()
+        2. Starts recording if the channel is live and matches keywords
+        3. Stops recording if the channel goes offline or stops matching keywords
+        4. Logs stream titles to a file
+        """
         while True:
             scheduled = await wait_for_platform_slot(self.platform)
             interval = platform_interval(self.platform)
@@ -535,12 +396,23 @@ class ChannelTask:
             await asyncio.sleep(interval)
 
     async def _probe(self) -> Tuple[bool, bool, str]:
+        """Check if a channel is live based on its platform."""
         if self.platform == "youtube":
             return await self._probe_youtube()
         else:
             return await self._probe_twitch()
 
     async def _probe_youtube(self) -> Tuple[bool, bool, str]:
+        """Check if a YouTube channel is currently live streaming.
+
+        Uses yt-dlp to check the live status and fetch the stream title.
+
+        Returns:
+            Tuple containing:
+            - bool: True if channel is live, False otherwise
+            - bool: True if keyword matches (or no keyword), False otherwise
+            - str: Stream title if available, empty string otherwise
+        """
         url = yt_live_url(self.name)
         cmd = ["yt-dlp", "--skip-download", "--print", "%(is_live)s|%(title)s", url]
         proc = await asyncio.create_subprocess_exec(
@@ -561,6 +433,18 @@ class ChannelTask:
         return live, keyword_ok, title
 
     async def _probe_twitch(self) -> Tuple[bool, bool, str]:
+        """Check if a Twitch channel is currently live streaming.
+
+        Uses streamlink to check the live status and fetch the stream title,
+        tags, and category. Considers a keyword match if it appears in the title,
+        tags, or exactly matches the category name.
+
+        Returns:
+            Tuple containing:
+            - bool: True if channel is live, False otherwise
+            - bool: True if keyword matches title, tags, or category (or no keyword)
+            - str: Stream title if available, empty string otherwise
+        """
         url = f"https://twitch.tv/{self.name}"
         cmd = ["streamlink", "--json", url, "best"]
         p = await asyncio.create_subprocess_exec(
@@ -597,6 +481,19 @@ class ChannelTask:
         return True, keyword_ok, title
 
     def _paths(self, title: str) -> Tuple[Path, Path]:
+        """Generate paths for the VOD file and its log file.
+
+        Creates file paths with the stream date and sanitized title, ensuring
+        unique filenames by adding a counter suffix if needed.
+
+        Args:
+            title: The stream title to use in the filenames
+
+        Returns:
+            Tuple containing:
+            - Path: Path to the VOD file (.mp4)
+            - Path: Path to the log file (.log)
+        """
         title = strip_end_date_time(title)
         safe_raw = title.strip()
         safe = "".join(ch if ch not in (os.sep, "\0") else "_" for ch in safe_raw)
@@ -617,6 +514,15 @@ class ChannelTask:
         return vod, log
 
     async def _start_recording(self, title: str):
+        """Start recording a live stream.
+
+        Creates output directories if needed, generates unique filenames based on
+        stream title and date, sends a Discord notification if configured, and
+        launches the appropriate recording process based on the platform.
+
+        Args:
+            title: The title of the stream being recorded
+        """
         vod_fp, log_fp = self._paths(title)
         self.current_vod_fp = vod_fp
 
@@ -671,6 +577,12 @@ class ChannelTask:
         )
 
     async def _stop_recording(self):
+        """Stop an active recording process.
+
+        Attempts to gracefully terminate the recording process. If the process
+        doesn't exit within 10 seconds, it will be forcibly killed. Updates the
+        process state to None after termination.
+        """
         # Logging for process state
         if self.proc is None:
             logger.debug(
@@ -697,31 +609,32 @@ class ChannelTask:
             try:
                 logger.debug(f"Waiting for process to exit... PID {process_id}")
                 await asyncio.wait_for(asyncio.to_thread(self.proc.wait), timeout=10)
-                logger.debug(
-                    f"Process terminated successfully: PID {process_id}"
-                )
+                logger.debug(f"Process terminated successfully: PID {process_id}")
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"Process {process_id} didn't terminate within timeout, sending kill signal"
+                    f"Process for {self.platform}::{self.name} did not exit after terminate(), sending KILL signal"
                 )
                 self.proc.kill()
-                logger.debug(f"Kill signal sent to process {process_id}")
-        except Exception as term_e:
-            logger.error(f"Error in process termination: {term_e}")
-            try:
-                self.proc.kill()
-                logger.debug("Fallback kill signal sent")
-            except Exception as kill_e:
-                logger.error(f"Failed fallback kill: {kill_e}")
+                await asyncio.to_thread(self.proc.wait)
+                logger.debug(f"Process killed: PID {process_id}")
 
-        self.proc = None
-        logger.debug(
-            f"Process reference cleared for {self.platform}::{self.name}"
-        )
+            self.proc = None
+
+        except Exception as e:
+            logger.error(f"Error stopping recording process: {e}")
+            self.proc = None
+        logger.debug(f"Process reference cleared for {self.platform}::{self.name}")
 
 
 # ───── Supervisor ───── #
 class Supervisor:
+    """Manages the collection of channel monitoring tasks.
+
+    The Supervisor is responsible for loading channel configurations, creating and
+    managing ChannelTask instances, providing a dashboard with status information,
+    and handling graceful shutdown of all tasks.
+    """
+
     def __init__(self):
         self.tasks: Dict[str, ChannelTask] = {}
         self.last_reload = 0.0
@@ -730,11 +643,25 @@ class Supervisor:
         self.dash_task: Optional[asyncio.Task] = None
 
     async def run(self):
+        """Start the supervisor and wait for the stop event.
+
+        Creates tasks for reloading channel configurations and updating the dashboard,
+        then waits for the stop event to be triggered by a shutdown request.
+        """
         self.reload_task = asyncio.create_task(self._reload_loop())
         self.dash_task = asyncio.create_task(self._dashboard_loop())
         await self.stop_evt.wait()
 
     async def shutdown(self, finish_recordings: bool = False):
+        """Gracefully shut down the supervisor and all managed tasks.
+
+        Cancels the reload and dashboard tasks, then handles all channel tasks
+        according to the finish_recordings parameter.
+
+        Args:
+            finish_recordings: If True, allows active recordings to continue in
+                the background. If False, stops all recordings.
+        """
         logger.info("Shutting down supervisor…")
         self.stop_evt.set()
 
@@ -845,12 +772,23 @@ class Supervisor:
             logger.info("No recordings could be continued in background")
 
     async def _reload_loop(self):
+        """Background task that periodically reloads the channel watchlist.
+
+        Runs in an infinite loop, periodically checking for changes to the
+        watchlist file and updating channel tasks accordingly.
+        """
         await self._load_watchlist()
         while True:
             await asyncio.sleep(RELOAD_INTERVAL)
             await self._load_watchlist()
 
     async def _load_watchlist(self):
+        """Load or reload the channel watchlist from the checkme.txt file.
+
+        Reads the CSV format file to discover channels to monitor, creates new
+        ChannelTask instances for new entries, and removes tasks for channels
+        that are no longer in the watchlist.
+        """
         self.last_reload = time.time()
         seen = set()
         if not CHECK_FILE.exists():
@@ -887,16 +825,31 @@ class Supervisor:
             _platform_counts[t.platform] = _platform_counts.get(t.platform, 0) + 1
 
     async def _dashboard_loop(self):
+        """Background task that periodically updates the console dashboard.
+
+        Provides a real-time status display showing all monitored channels,
+        their live status, and recording status at regular intervals.
+        Uses ANSI escape sequences for efficient screen updates without flashing.
+        Limits updates based on global DASH_FPS setting to prevent excessive CPU usage.
+        """
+        update_interval = 1.0 / DASH_FPS
+        first_run = True
+
         while True:
-            os.system("clear")
+            # Build all lines in a list before printing
+            display_lines = []
             reload_in = max(0, int(self.last_reload + RELOAD_INTERVAL - time.time()))
-            print(
-                f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  –  VOD Watcher   (next reload in {reload_in}s)\n"
+
+            # Add header lines
+            display_lines.append(
+                f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  -  VOD Watcher   (next reload in {reload_in}s)\n"
             )
-            print(
+            display_lines.append(
                 f"{'Platform':8} {'Channel':20} {'Keyword':12} {'State':10} {'Next':6} Title"
             )
-            print("-" * 100)
+            display_lines.append("-" * 100)
+
+            # Add each task's information
             for t in self.tasks.values():
                 # Determine state and color
                 if t.detached_pid:
@@ -929,129 +882,34 @@ class Supervisor:
                 else:
                     next_str = f"{next_in}s"
 
-                print(
+                # Add formatted line to display
+                display_lines.append(
                     f"{t.platform:8} {t.name:20.20} {t.keyword[:11]:12} "
                     f"{colour}{state:10}{RESET} {next_str:6} {t.current_title[:60]}"
                 )
-            await asyncio.sleep(1 / DASH_FPS)
 
+            if first_run:
+                # First run - just print everything
+                print("\n".join(display_lines))
+                first_run = False
+            else:
+                # Move cursor to home position and erase the screen from there
+                print(f"{CURSOR_HOME}{ERASE_DOWN}", end="")
+                print("\n".join(display_lines))
 
-# ───── entrypoint ───── #
-def _verify_ffmpeg():
-    """Check if FFmpeg is installed."""
-    is_win = sys.platform.startswith("win")
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if is_win else 0,
-        )
-
-        if result.returncode == 0:
-            logger.info("FFmpeg found")
-            return True
-
-        logger.error("FFmpeg check failed")
-        return False
-    except FileNotFoundError:
-        tip = "Download from ffmpeg.org" if is_win else "Use apt/yum install ffmpeg"
-        logger.error(f"FFmpeg not found. {tip}")
-        return False
-    except Exception as e:
-        logger.error(f"FFmpeg error: {e}")
-        return False
-
-
-def verify_paths():
-    logger.info("Verifying file paths and permissions...")
-
-    if not _verify_directories():
-        return False
-
-    if not _verify_files():
-        return False
-
-    if not _verify_ffmpeg():
-        return False
-
-    logger.info("File path verification successful")
-    return True
-
-
-def _verify_directories():
-    directories = [
-        (VOD_ROOT, "VOD output directory"),
-        (LOG_ROOT, "Log directory"),
-        (LOG_DIR, "Program log directory"),
-        (SCRIPT_DIR, "Script directory"),
-    ]
-
-    for path, description in directories:
-        if not path.exists():
-            try:
-                path.mkdir(parents=True, exist_ok=True)
-                logger.info(f"Created {description} at {path}")
-            except (PermissionError, OSError) as e:
-                logger.error(f"Cannot create {description} at {path}: {e}")
-                return False
-
-        test_file = path / ".write_test"
-        try:
-            test_file.write_text("test")
-            test_file.unlink()
-        except (PermissionError, OSError) as e:
-            logger.error(f"No write permission for {description} at {path}: {e}")
-            return False
-
-    return True
-
-
-def _verify_files():
-    if not CHECK_FILE.exists():
-        try:
-            example_content = (
-                "# Format: platform,channel,keyword\n"
-                "# Example:\n"
-                "# youtube,@channelname,keyword\n"
-                "# twitch,channelname,keyword\n"
-            )
-            CHECK_FILE.write_text(example_content)
-            logger.info(f"Created example configuration at {CHECK_FILE}")
-        except (PermissionError, OSError) as e:
-            logger.error(f"Cannot create configuration file at {CHECK_FILE}: {e}")
-            return False
-
-    try:
-        CHECK_FILE.read_text()
-    except (PermissionError, OSError) as e:
-        logger.error(f"Cannot read configuration file at {CHECK_FILE}: {e}")
-        return False
-
-    try:
-        if DETACHED_FILE.exists():
-            content = DETACHED_FILE.read_text()
-            try:
-                json.loads(content)
-            except json.JSONDecodeError:
-                logger.warning(
-                    "Detached process file contains invalid JSON, resetting it"
-                )
-                DETACHED_FILE.write_text("{}")
-        else:
-            DETACHED_FILE.write_text("{}")
-            logger.info(f"Created detached process state file at {DETACHED_FILE}")
-    except (PermissionError, OSError) as e:
-        logger.error(
-            f"Cannot access detached process state file at {DETACHED_FILE}: {e}"
-        )
-        return False
-
-    return True
+            # Wait before updating again, using global FPS setting
+            await asyncio.sleep(update_interval)
 
 
 def main():
+    """Application entry point.
+
+    Verifies all required paths and dependencies, initializes the event loop,
+    creates a Supervisor instance, and runs the main application loop.
+
+    Handles keyboard interrupts by allowing the user to choose whether to
+    let ongoing recordings finish before shutting down.
+    """
     if not verify_paths():
         logger.error("Exiting due to file system permission/access errors.")
         sys.exit(1)
