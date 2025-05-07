@@ -7,6 +7,7 @@ __pycache__/
 # Custom additions
 vodenv/
 venv/
+.venv/
 .env
 checkme.txt
 logs/*

@@ -1,60 +1,107 @@
 # VOD Watcher
 
-A 24/7 YouTube & Twitch VOD recorder for Raspberry Pi 4 (or any Linux box).
-Continuously monitors channels, applies keyword filters, and automatically records live streams to MP4.
+A 24/7 YouTube & Twitch VOD recorder for Linux and Raspberry Pi.
+Continuously monitors channels, applies keyword filters, and automatically records livestreams to MP4 files.
 
 ---
 
 ## Features
 
-* **Multi-platform**: YouTube & Twitch support
-* **Keyword filtering**: Only record when your keyword appears in the stream title/tags
-* **Auto-retry**: Probes have exponential back-off on failures
-* **Rotating logs**: Both per-channel probe logs and a main watcher log
+* **Multi-service**: YouTube & Twitch support
+* **Smart filtering**:
+  * Record when keywords appear in the stream title
+  * Record when the stream's category matches your keyword (case-insensitive)
+* **Detached recordings**: Continue capturing streams even after program exits (optional)
+* **Discord notifications**: Receive alerts when recordings start (optional)
+* **Auto-retry**: Built-in exponential back-off for stability
+* **Rotating logs**: Both per-channel and main watcher logs
 * **Live dashboard**: Terminal view with colors and countdown timers
+
+---
+
+## Requirements
+
+* **Linux** operating system (Ubuntu, Debian, Raspberry Pi OS, etc.)
+* **Python 3.9+**
+* **FFmpeg**: Required for video processing
+* **External tools**: `requirements.txt`
 
 ---
 
 ## Installation
 
-1. **Clone or copy** the repo:
+1. **Clone or download** this repository
 
-2. **Install system deps**
+2. **Install FFmpeg**:
+   ```bash
+   # Debian/Ubuntu/Raspberry Pi OS
+   sudo apt install ffmpeg
+   
+   # Fedora
+   sudo dnf install ffmpeg
+   
+   # Arch Linux
+   sudo pacman -S ffmpeg
+   ```
 
-   * Python 3.9+ (asyncio + `logging.handlers` used)
-   * `ffmpeg` (for `yt-dlp` merging)
-
-3. **Install Python packages**:
+3. **Install Python dependencies**:
 
    ```bash
    pip3 install -r requirements.txt
    ```
 
-4. **Install CLI tools**:
+---
 
-   ```bash
-   # yt-dlp provides the YouTube downloader
-   pip3 install yt-dlp
-   # streamlink handles Twitch HLS streaming
-   pip3 install streamlink
+## Setup
+
+1. **Rename setup files**:
+   * Rename `NAME_MEenv.py` to `env.py`
+   * Rename `NAME_MEcheckme.txt` to `checkme.txt`
+
+2. **Configure environment**:
+   Edit `env.py` and set the required paths:
+   ```python
+   # Required settings
+   VOD_ROOT = "/path/to/vod/storage"  # Where recordings will be saved
+   LOG_ROOT = "/path/to/log/storage" # Where log files will be saved
+   
+   # Optional settings (leave empty if not needed)
+   DISCORD_WEBHOOK_URL = ""  # For Discord notifications
+   YOUTUBE_API_KEY = ""     # For YouTube channel profile pictures
+   TWITCH_CLIENT_ID = ""    # For Twitch channel profile pictures
+   TWITCH_CLIENT_SECRET = "" # For Twitch channel profile pictures
    ```
+
+3. **Configure channels**:
+   Edit `checkme.txt` with your channels and keywords:
+   ```csv
+   # platform, channel_or_id, keyword
+   twitch,xqc,drama
+   youtube,@pewdiepie,chatting
+   ```
+
+   * **platform**: Either `youtube` or `twitch`
+   * **channel\_or\_id**: 
+     * For YouTube: Channel handle (with @) or channel ID
+     * For Twitch: Username
+   * **keyword**: 
+     * Records when this appears in the title
+     * For Twitch: Also records when stream category exactly matches this keyword (case-insensitive)
+     * Leave empty to record all streams from this channel
 
 ---
 
-## Configuration
+## Optional Discord Integration
 
-1. Rename `NAME_MEcheckme.txt` to `checkme.txt`.
-2. Populate `checkme.txt` with lines like:
+To enable Discord notifications when recordings start:
 
-```csv
-# platform, channel_or_id, keyword
-twitch,xqc,drama
-youtube,@pewdiepie,chatting
-```
+1. Create a webhook in your Discord server (Server Settings → Integrations → Webhooks)
+2. Copy the webhook URL to `DISCORD_WEBHOOK_URL` in your `env.py`
 
-* **platform**: `youtube` or `twitch`
-* **channel\_or\_id**: YouTube handle/ID or Twitch username
-* **keyword**: (optional) only record when this appears in the title/tags
+For profile pictures in notifications:
+
+* **YouTube profile picture**: Get an API key from [Google Cloud Console](https://console.cloud.google.com/)
+* **Twitch profile picture**: Register an application on the [Twitch Developer Console](https://dev.twitch.tv/console)
 
 ---
 
@@ -64,7 +111,7 @@ youtube,@pewdiepie,chatting
 python3 vod_watcher.py
 ```
 
-You’ll see a continuously-updating dashboard:
+You'll see a continuously-updating dashboard:
 
 ```
 2025-05-04 12:34:56  –  VOD Watcher   (next reload in 120s)
@@ -75,20 +122,19 @@ twitch   xqc                  drama        LIVE/REC   15s    🐦LIVE🐦CLICK�
 youtube  @pewdiepie           chatting     OFF        42s    <not live>
 ```
 
-* **CTRL+C** exists the program.
+* **CTRL+C** exits the program.
 
-> WARNING - This shuts down all recording processes as well.
+You will be asked if you want to stop recording processes or let them finish. If you choose to let them finish, the recordings will continue as "detached processes" even after the main program exits.
+
+> **Detached Recording Feature**: When you let recordings continue after program exit, VOD Watcher tracks these in a `.detached.json` file. Next time you start the program, it automatically recognizes and monitors these ongoing recordings.
 
 ---
 
 ## Log Files
 
-* **Main watcher log**:
-  `./logs/vod_watcher.log` (rotating, up to 5 MB each, 3 backups)
-
-* **Per-channel recording logs**:
-  `/mnt/media/logs/processed/<channel>/*.log`
-  Records start/stop timestamps and the `yt-dlp`/`streamlink` output.
+* **Main log**: `./logs/vod_watcher.log` (rotating, up to 5MB each, 3 backups)
+* **Channel logs**: Stored in your configured `LOG_ROOT` directory
+* **Detached process tracking**: `.detached.json` tracks recordings that continue after program exit
 
 To follow the main log in real time:
 
@@ -100,24 +146,28 @@ tail -f logs/vod_watcher.log
 
 ## Customization
 
-You can tweak these constants at the top of `vod_watcher.py`:
+You can adjust these settings in `env.py`:
 
-* `RELOAD_INTERVAL` – how often to re-read `checkme.txt` (seconds)
-					DO NOT SET THIS BELOW 60sec
-* `PROBE_INTERVAL`  – baseline delay between probes (per channel)
-					DO NOT SET THIS TOO LOW OR THE PLATFORMS WILL BLOCK YOU
-* `PLATFORM_COOLDOWN` – minimum gap between probes on the same platform
-					  DO NOT SET THIS TOO LOW OR THE PLATFORM WILL BLOCK YOU
-* `MAX_YT_HEIGHT`   – maximum video height for YouTube recordings
+* `RELOAD_INTERVAL` – How often to reload the channel list (min 60s)
+* `PROBE_INTERVAL` – Base delay between checking the same channel (min 60s)
+* `PLATFORM_COOLDOWN` – Minimum gap between probes on the same platform (min 30s)
+
+**IMPORTANT**: Setting intervals too low may get you rate-limited or IP-banned by YouTube/Twitch!
 
 ---
 
 ## Troubleshooting
 
-* **streamlink / yt-dlp not found**
-  Ensure you installed them via `pip install streamlink yt-dlp` or your OS package manager.
+* **No recordings being made**
+  * Verify your `checkme.txt` format is correct
+  * Check console output and logs for errors
+  * Ensure FFmpeg, yt-dlp, and streamlink are properly installed
 
-* **Permission denied writing to `/mnt/media/...`**
-  Verify that your user has write access to the mount points.
+* **Discord notifications not working**
+  * Verify your webhook URL is correct
+  * Check that your bot has permission to post in the channel
+
+* **Permission issues**
+  * Ensure you have write access to both VOD_ROOT and LOG_ROOT directories
 
 ---
