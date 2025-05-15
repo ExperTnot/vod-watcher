@@ -559,6 +559,7 @@ class ChannelTask:
                 "best",
                 "--twitch-disable-hosting",
                 "--twitch-disable-ads",
+                "--ffmpeg-fout", "mp4",
                 "-o",
                 str(vod_fp),
             ]
@@ -659,6 +660,134 @@ class Supervisor:
         self.dash_task = asyncio.create_task(self._dashboard_loop())
         await self.stop_evt.wait()
 
+    async def _cancel_system_tasks(self):
+        """Cancel dashboard and reload tasks."""
+        for t in (self.reload_task, self.dash_task):
+            if t:
+                t.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(
+                *(t for t in (self.reload_task, self.dash_task) if t),
+                return_exceptions=True,
+            )
+
+    async def _stop_all_tasks(self, delete_partials: bool):
+        """Stop all tasks when no recordings are active."""
+        await asyncio.gather(
+            *(task.stop(abort_recording=True, delete_partials=delete_partials) for task in self.tasks.values()),
+            return_exceptions=True,
+        )
+
+    def _sort_tasks_by_recording_status(self, finish_recordings: bool):
+        """Sort tasks into those to keep running and those to stop.
+        
+        Args:
+            finish_recordings: If True, allows active recordings to continue.
+        
+        Returns:
+            Tuple of (tasks_to_keep, tasks_to_stop)
+        """
+        to_keep = []
+        to_stop = []
+        
+        for task in self.tasks.values():
+            if finish_recordings and task.is_recording():
+                to_keep.append(task)
+            else:
+                to_stop.append(task)
+                # Ensure any detached process is included for termination
+                if task.detached_pid and not finish_recordings:
+                    logger.debug(
+                        f"Including detached process for {task.platform}::{task.name} for termination"
+                    )
+                    # Make sure proc is None so we directly handle the detached process
+                    task.proc = None
+                
+        return to_keep, to_stop
+
+    async def _stop_selected_tasks(self, tasks, delete_partials: bool):
+        """Stop the specified tasks.
+        
+        Args:
+            tasks: List of tasks to stop
+            delete_partials: If True, deletes partial VOD files when stopping recordings
+        """
+        await asyncio.gather(
+            *(task.stop(abort_recording=True, delete_partials=delete_partials) for task in tasks),
+            return_exceptions=True,
+        )
+
+    def _save_detached_process_data(self, task, pid):
+        """Save information about a detached recording process.
+        
+        Args:
+            task: The channel task that will continue recording
+            pid: Process ID of the recording process
+        
+        Returns:
+            True if the process data was saved successfully
+        """
+        data = {}
+        if DETACHED_FILE.exists():
+            try:
+                data = json.loads(DETACHED_FILE.read_text())
+            except Exception:
+                data = {}
+
+        key = f"{task.platform}::{task.name.lower()}"
+
+        # Save comprehensive information about the recording
+        process_data = {
+            "pid": pid,
+            "platform": task.platform,
+            "channel": task.name,
+            "title": task.current_title,
+            "keyword": task.keyword,
+            "vod_path": str(task.current_vod_fp)
+            if task.current_vod_fp
+            else None,
+            "timestamp": dt.datetime.now().isoformat(),
+        }
+
+        data[key] = process_data
+        DETACHED_FILE.write_text(json.dumps(data))
+        task.detached_pid = pid
+        
+        logger.info(f"  - {task.platform}::{task.name} - {task.current_title}")
+        return True
+
+    async def _handle_continued_recordings(self, tasks_to_keep):
+        """Handle tasks that should continue recording in the background.
+        
+        Args:
+            tasks_to_keep: List of tasks to keep running
+        
+        Returns:
+            Number of recordings that will continue in the background
+        """
+        continued_count = 0
+        
+        for task in tasks_to_keep:
+            # Check if still recording after the other tasks were stopped
+            if task.is_recording():
+                pid = None
+                if task.proc and task.proc.poll() is None:
+                    pid = task.proc.pid
+                elif task.detached_pid:
+                    pid = task.detached_pid
+
+                if pid:
+                    if self._save_detached_process_data(task, pid):
+                        continued_count += 1
+        
+        # Cancel task loops but don't terminate the processes
+        await asyncio.gather(
+            *(task._stop_task_loop() for task in tasks_to_keep),
+            return_exceptions=True,
+        )
+        
+        return continued_count
+
     async def shutdown(self, finish_recordings: bool = False, delete_partials: bool = True):
         """Gracefully shut down the supervisor and all managed tasks.
 
@@ -675,14 +804,7 @@ class Supervisor:
         self.stop_evt.set()
 
         # Cancel dashboard and reload tasks
-        for t in (self.reload_task, self.dash_task):
-            if t:
-                t.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(
-                *(t for t in (self.reload_task, self.dash_task) if t),
-                return_exceptions=True,
-            )
+        await self._cancel_system_tasks()
 
         # First identify all recording tasks
         recording_tasks = [task for task in self.tasks.values() if task.is_recording()]
@@ -690,10 +812,7 @@ class Supervisor:
         if not recording_tasks:
             logger.info("No channels are currently recording")
             # Stop all tasks before exiting
-            await asyncio.gather(
-                *(task.stop(abort_recording=True, delete_partials=delete_partials) for task in self.tasks.values()),
-                return_exceptions=True,
-            )
+            await self._stop_all_tasks(delete_partials)
             return
 
         # List channels that are recording
@@ -702,77 +821,14 @@ class Supervisor:
         else:
             logger.info(f"Aborting {len(recording_tasks)} recordings:")
 
-        to_keep = []
-        to_stop = []
-        continued_count = 0
-
         # Sort tasks into those to keep running and those to stop
-        for task in self.tasks.values():
-            if finish_recordings and task.is_recording():
-                to_keep.append(task)
-            else:
-                to_stop.append(task)
-                # Ensure any detached process is included for termination
-                if task.detached_pid and not finish_recordings:
-                    logger.debug(
-                        f"Including detached process for {task.platform}::{task.name} for termination"
-                    )
-                    # Make sure proc is None so we directly handle the detached process
-                    task.proc = None
+        to_keep, to_stop = self._sort_tasks_by_recording_status(finish_recordings)
 
         # Stop tasks that shouldn't continue recording
-        await asyncio.gather(
-            *(task.stop(abort_recording=True, delete_partials=delete_partials) for task in to_stop),
-            return_exceptions=True,
-        )
+        await self._stop_selected_tasks(to_stop, delete_partials)
 
-        # Now handle tasks that should keep recording
-        for task in to_keep:
-            # Check if still recording after the other tasks were stopped
-            if task.is_recording():
-                pid = None
-                if task.proc and task.proc.poll() is None:
-                    pid = task.proc.pid
-                elif task.detached_pid:
-                    pid = task.detached_pid
-
-                if pid:
-                    continued_count += 1
-                    data = {}
-                    if DETACHED_FILE.exists():
-                        try:
-                            data = json.loads(DETACHED_FILE.read_text())
-                        except Exception:
-                            data = {}
-
-                    key = f"{task.platform}::{task.name.lower()}"
-
-                    # Save comprehensive information about the recording
-                    process_data = {
-                        "pid": pid,
-                        "platform": task.platform,
-                        "channel": task.name,
-                        "title": task.current_title,
-                        "keyword": task.keyword,
-                        "vod_path": str(task.current_vod_fp)
-                        if task.current_vod_fp
-                        else None,
-                        "timestamp": dt.datetime.now().isoformat(),
-                    }
-
-                    data[key] = process_data
-                    DETACHED_FILE.write_text(json.dumps(data))
-                    task.detached_pid = pid
-
-                    logger.info(
-                        f"  - {task.platform}::{task.name} - {task.current_title}"
-                    )
-
-        # Cancel task loops but don't terminate the processes
-        await asyncio.gather(
-            *(task._stop_task_loop() for task in to_keep),
-            return_exceptions=True,
-        )
+        # Handle tasks that should keep recording
+        continued_count = await self._handle_continued_recordings(to_keep)
 
         # Final summary
         if finish_recordings and continued_count > 0:
