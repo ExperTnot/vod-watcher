@@ -523,7 +523,7 @@ class ChannelTask:
                 )
 
                 if self.keyword.lower() == category.lower():
-                    logger.info(
+                    logger.debug(
                         f"Twitch channel {self.name} has category '{category}' matching keyword '{self.keyword}', recording even though title doesn't contain keyword"
                     )
                     keyword_ok = True
