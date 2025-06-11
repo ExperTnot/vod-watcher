@@ -580,10 +580,9 @@ class ChannelTask:
         return final_vod_path, log_fp # final_vod_path is .ts for Twitch, .mp4 for YouTube
 
     async def _start_recording(self, title: str):
-        # Call _paths() if ts_vod_fp or mp4_vod_fp is not set
-        if (self.platform == "twitch" and not self.ts_vod_fp) or (self.platform == "youtube" and not self.mp4_vod_fp):
-            logger.debug(f"[{self.platform}::{self.name}] Calling _paths() to set file paths before recording")
-            self._paths(title)
+        # Always call _paths() to generate fresh paths for every new recording
+        logger.debug(f"[{self.platform}::{self.name}] Generating new file paths for recording")
+        self._paths(title)
             
         # self.current_vod_fp will be the file actively written to.
         if self.platform == "twitch":
