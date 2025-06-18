@@ -5,6 +5,21 @@ Continuously monitors channels, applies keyword filters, and automatically recor
 
 ---
 
+## Table of Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Setup](#setup)
+- [Optional Discord Integration](#optional-discord-integration)
+- [Usage](#usage)
+- [Running in the Background with tmux (recommended)](#running-in-the-background-with-tmux-recommended)
+- [Log Files](#log-files)
+- [Customization](#customization)
+- [Troubleshooting](#troubleshooting)
+
+---
+
 ## Features
 
 * **Multi-service**: YouTube & Twitch support
@@ -44,10 +59,18 @@ Continuously monitors channels, applies keyword filters, and automatically recor
    sudo pacman -S ffmpeg
    ```
 
-3. **Install Python dependencies**:
-
+3. **Create a virtual environment** (recommended):
    ```bash
-   pip3 install -r requirements.txt
+   # Create a virtual environment in .venv directory
+   python3 -m venv .venv
+   
+   # Activate the virtual environment
+   source .venv/bin/activate
+   ```
+
+4. **Install Python dependencies** (inside the virtual environment):
+   ```bash
+   pip install -r requirements.txt
    ```
 
 ---
@@ -127,6 +150,45 @@ youtube  @pewdiepie           chatting     OFF        42s    <not live>
 You will be asked if you want to stop recording processes or let them finish. If you choose to let them finish, the recordings will continue as "detached processes" even after the main program exits.
 
 > **Detached Recording Feature**: When you let recordings continue after program exit, VOD Watcher tracks these in a `.detached.json` file. Next time you start the program, it automatically recognizes and monitors these ongoing recordings.
+
+---
+
+## Running in the Background with tmux (recommended)
+
+[tmux](https://github.com/tmux/tmux/wiki) is a terminal multiplexer that allows you to run processes in the background and detach/reattach to sessions, making it perfect for keeping VOD Watcher running 24/7.
+
+### Basic tmux Commands
+
+1. **Create a new named session**:
+   ```bash
+   tmux new -s vod-watcher
+   ```
+   This creates a new session named "vod-watcher" and attaches to it.
+
+2. **Start VOD Watcher** inside the tmux session:
+   ```bash
+   source .venv/bin/activate
+   python3 vod_watcher.py
+   ```
+
+3. **Detach from the session** (without stopping VOD Watcher):
+   Press `Ctrl+b` then `d`
+   
+   Your VOD Watcher will continue running in the background, even if you close your terminal or disconnect from SSH.
+
+4. **List all tmux sessions**:
+   ```bash
+   tmux ls
+   ```
+   You'll see something like: `vod-watcher: 1 windows (created Thu Jun 18 21:58:55 2025) [80x24]`
+
+5. **Reattach to the session** later to check status or make changes:
+   ```bash
+   tmux a -t vod-watcher
+   ```
+
+6. **Exit the session** if you want to stop it (stop VOD Watcher first):
+   Press `Ctrl+d` to exit the session.
 
 ---
 
