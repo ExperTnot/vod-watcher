@@ -13,3 +13,4 @@ checkme.txt
 logs/*
 .detached.json
 env.py
+.vscode/

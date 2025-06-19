@@ -1031,7 +1031,7 @@ class Supervisor:
                 platform = platform.lower()
                 if platform not in ("youtube", "twitch"):
                     logger.warning(
-                        f"Skipping unknown platform '{platform}' in checkme.txt"
+                        f"Skipping unknown platform '{platform}' in {CHECK_FILE}."
                     )
                     continue
 
