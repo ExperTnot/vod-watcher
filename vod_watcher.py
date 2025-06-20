@@ -68,9 +68,6 @@ STREAMLINK_SEGMENT_ATTEMPTS = 10 # default is 3
 STREAMLINK_SEGMENT_TIMEOUT = 10 # default is 10
 STREAMLINK_TIMEOUT = 120 # default is 60
 
-RECONNECT_WINDOW = 180  # Grace period in seconds (3 minutes) to attempt reconnecting
-RAPID_PROBE_INTERVAL = 15  # Seconds between rapid reconnection probes
-
 # ───── color and terminal setup ───── #
 USE_COLOR = sys.stdout.isatty() and ("TERM" in os.environ)
 if USE_COLOR:
@@ -639,6 +636,7 @@ class ChannelTask:
                 "--merge-output-format",
                 "mp4",
                 "--no-part",
+                "--live-from-start",
             ]
         else:
             url = f"https://twitch.tv/{self.name}"
@@ -668,9 +666,7 @@ class ChannelTask:
         self.proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-            if not self.platform == "youtube"
-            else open(log_fp, "a", encoding="utf-8"),
+            stderr=log_fp,
             text=False,
             preexec_fn=os.setsid,
         )
