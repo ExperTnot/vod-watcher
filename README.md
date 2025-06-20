@@ -210,9 +210,9 @@ tail -f logs/vod_watcher.log
 
 You can adjust these settings in `env.py`:
 
-* `RELOAD_INTERVAL` – How often to reload the channel list (min 60s)
-* `PROBE_INTERVAL` – Base delay between checking the same channel (min 60s)
-* `PLATFORM_COOLDOWN` – Minimum gap between probes on the same platform (min 30s)
+* `RELOAD_INTERVAL` – How often to reload the channel list (min 45s)
+* `PROBE_INTERVAL` – Base delay between checking the same channel (min 45s)
+* `PLATFORM_COOLDOWN` – Minimum gap between probes on the same platform (min 20s)
 
 **IMPORTANT**: Setting intervals too low may get you rate-limited or IP-banned by YouTube/Twitch!
 

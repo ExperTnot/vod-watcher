@@ -59,10 +59,17 @@ DETACHED_FILE = SCRIPT_DIR / ".detached.json"
 LOG_DIR = SCRIPT_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 MAIN_LOG = LOG_DIR / "vod_watcher.log"
-RELOAD_INTERVAL = max(60, RELOAD_INTERVAL)
-PROBE_INTERVAL = max(60, PROBE_INTERVAL)
-PLATFORM_COOLDOWN = max(30, PLATFORM_COOLDOWN)
+RELOAD_INTERVAL = max(45, RELOAD_INTERVAL)
+PROBE_INTERVAL = max(45, PROBE_INTERVAL)
+PLATFORM_COOLDOWN = max(20, PLATFORM_COOLDOWN)
 MAX_YT_HEIGHT = 1080
+
+STREAMLINK_SEGMENT_ATTEMPTS = 10 # default is 3
+STREAMLINK_SEGMENT_TIMEOUT = 10 # default is 10
+STREAMLINK_TIMEOUT = 120 # default is 60
+
+RECONNECT_WINDOW = 180  # Grace period in seconds (3 minutes) to attempt reconnecting
+RAPID_PROBE_INTERVAL = 15  # Seconds between rapid reconnection probes
 
 # ───── color and terminal setup ───── #
 USE_COLOR = sys.stdout.isatty() and ("TERM" in os.environ)
@@ -641,9 +648,11 @@ class ChannelTask:
                 "best",
                 "--twitch-disable-hosting",
                 "--twitch-disable-ads",
-                # Removed --ffmpeg-fout mp4, streamlink will output .ts or similar
                 "-o",
                 str(vod_fp),
+                "--stream-segment-attempts", str(STREAMLINK_SEGMENT_ATTEMPTS),
+                "--stream-segment-timeout", str(STREAMLINK_SEGMENT_TIMEOUT),
+                "--stream-timeout", str(STREAMLINK_TIMEOUT),
             ]
 
         logger.info(f"START {self.platform}::{self.name} → {vod_fp.name}")
