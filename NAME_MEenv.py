@@ -1,9 +1,9 @@
 # Required settings
 VOD_ROOT = "/path/to/vod/storage" # Path to store VODs
 LOG_ROOT = "/path/to/log/storage" # Path to store logs
-RELOAD_INTERVAL = 300  # seconds with minimum of 60
-PROBE_INTERVAL = 120   # seconds with minimum of 60
-PLATFORM_COOLDOWN = 60  # seconds with minimum of 30
+RELOAD_INTERVAL = 300  # seconds with minimum of 45
+PROBE_INTERVAL = 120   # seconds with minimum of 45
+PLATFORM_COOLDOWN = 60  # seconds with minimum of 20
 
 # Optional settings for Discord notifications and profile pictures
 DISCORD_WEBHOOK_URL = ""  # Discord webhook URL for notifications (optional)
