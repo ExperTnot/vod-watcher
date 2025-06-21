@@ -39,7 +39,7 @@ from env import (
     PLATFORM_COOLDOWN,
 )
 from api import send_discord_notification
-from verifications import verify_paths, verify_vod_files
+from verifications import verify_paths
 from utils import (
     _spawn_count,
     _platform_counts,
@@ -64,9 +64,9 @@ PROBE_INTERVAL = max(45, PROBE_INTERVAL)
 PLATFORM_COOLDOWN = max(20, PLATFORM_COOLDOWN)
 MAX_YT_HEIGHT = 1080
 
-STREAMLINK_SEGMENT_ATTEMPTS = 10 # default is 3
-STREAMLINK_SEGMENT_TIMEOUT = 10 # default is 10
-STREAMLINK_TIMEOUT = 120 # default is 60
+STREAMLINK_SEGMENT_ATTEMPTS = 10  # default is 3
+STREAMLINK_SEGMENT_TIMEOUT = 10  # default is 10
+STREAMLINK_TIMEOUT = 120  # default is 60
 
 # ───── color and terminal setup ───── #
 USE_COLOR = sys.stdout.isatty() and ("TERM" in os.environ)
@@ -81,8 +81,8 @@ if USE_COLOR:
 else:
     RED = YELLOW = GREEN = BLUE = RESET = ""
 
-CURSOR_HOME = "\033[H" # Move cursor to top left
-ERASE_DOWN = "\033[J" # Erase from cursor to end of screen
+CURSOR_HOME = "\033[H"  # Move cursor to top left
+ERASE_DOWN = "\033[J"  # Erase from cursor to end of screen
 
 DASH_FPS = 2
 
@@ -120,11 +120,10 @@ class ChannelTask:
         self.name = name.strip()
         self.keyword = keyword.lower().strip()
         self.proc: Optional[subprocess.Popen] = None
-        self.ts_vod_fp: Optional[Path] = None  # For Twitch .ts files
-        self.mp4_vod_fp: Optional[Path] = None # For final .mp4 files (Twitch converted, YouTube direct)
+        self.vod_fp: Optional[Path] = (
+            None  # Path to the VOD file (.ts for Twitch, .mp4 for YouTube)
+        )
         self.log_file_handle = None  # File handle for stderr logs
-        self.conversion_pending: bool = False
-        self.conversion_last_status: Optional[str] = None
 
         self.current_title: str = "<awaiting check>"
         self.live_raw: Optional[bool] = None
@@ -136,7 +135,7 @@ class ChannelTask:
         self.next_probe = time.time() + idx * PLATFORM_COOLDOWN
         self.loop: Optional[asyncio.Task] = None
         # self.current_vod_fp will point to the active recording file (.ts for Twitch, .mp4 for YouTube)
-        self.current_vod_fp: Optional[Path] = None 
+        self.current_vod_fp: Optional[Path] = None
         self.detached_pid: Optional[int] = None
         self._load_detached()
 
@@ -189,7 +188,8 @@ class ChannelTask:
             if self.proc:
                 if self.proc.poll() is None:
                     try:
-                        self.proc.kill()
+                        # Use our _stop_recording method to properly log the abort
+                        await self._stop_recording(reason="Recording aborted by user")
                         process_was_running_and_killed_by_this_abort = True
                         logger.info(
                             f"ABORT {self.platform}::{self.name} (process killed during abort)"
@@ -264,9 +264,7 @@ class ChannelTask:
                                 f"Failed to delete VOD file {vod_fp} after abort: {e}"
                             )
                     else:
-                        logger.info(
-                            f"Kept partial VOD {vod_fp.name} as requested."
-                        )
+                        logger.info(f"Kept partial VOD {vod_fp.name} as requested.")
                 elif vod_fp:
                     logger.info(
                         f"VOD file {vod_fp.name} for aborted recording was not found."
@@ -305,7 +303,9 @@ class ChannelTask:
                         if self.platform == "twitch" and loaded_path.suffix == ".ts":
                             self.ts_vod_fp = loaded_path
                             self.mp4_vod_fp = loaded_path.with_suffix(".mp4")
-                        elif self.platform == "youtube" and loaded_path.suffix == ".mp4":
+                        elif (
+                            self.platform == "youtube" and loaded_path.suffix == ".mp4"
+                        ):
                             self.mp4_vod_fp = loaded_path
                     self.detached_data = process_data
                 elif isinstance(process_data, int):
@@ -329,11 +329,23 @@ class ChannelTask:
                             f"Detached process for {self.platform}::{self.name} has completed naturally. VOD preserved."
                         )
                         # If the completed VOD is a .ts file, schedule it for conversion
-                        if self.detached_process_completed and self.current_vod_fp and self.current_vod_fp.exists() and self.current_vod_fp.suffix == ".ts":
-                            logger.info(f"Detached recording {self.current_vod_fp.name} completed. Scheduling conversion.")
-                            if self.platform == "twitch" and self.current_vod_fp.suffix == ".ts": # Only convert if it's a Twitch .ts file
-                                logger.info(f"Detached Twitch recording {self.current_vod_fp.name} completed. Scheduling conversion.")
-                                self.conversion_pending = True # Mark for conversion
+                        if (
+                            self.detached_process_completed
+                            and self.current_vod_fp
+                            and self.current_vod_fp.exists()
+                            and self.current_vod_fp.suffix == ".ts"
+                        ):
+                            logger.info(
+                                f"Detached recording {self.current_vod_fp.name} completed. Scheduling conversion."
+                            )
+                            if (
+                                self.platform == "twitch"
+                                and self.current_vod_fp.suffix == ".ts"
+                            ):  # Only convert if it's a Twitch .ts file
+                                logger.info(
+                                    f"Detached Twitch recording {self.current_vod_fp.name} completed. Scheduling conversion."
+                                )
+                                self.conversion_pending = True  # Mark for conversion
                                 # Clean up the entry from detached file to prevent re-processing
                                 if DETACHED_FILE.exists():
                                     try:
@@ -342,12 +354,20 @@ class ChannelTask:
                                         if _key in _data:
                                             _data.pop(_key)
                                             DETACHED_FILE.write_text(json.dumps(_data))
-                                            logger.debug(f"Removed {_key} from detached processes file after scheduling conversion.")
+                                            logger.debug(
+                                                f"Removed {_key} from detached processes file after scheduling conversion."
+                                            )
                                     except Exception as e_json:
-                                        logger.warning(f"Failed to update detached process file for {_key} after scheduling conversion: {e_json}")
-                                asyncio.create_task(self._convert_ts_to_mp4()) # ts_filepath is now self.ts_vod_fp
+                                        logger.warning(
+                                            f"Failed to update detached process file for {_key} after scheduling conversion: {e_json}"
+                                        )
+                                asyncio.create_task(
+                                    self._convert_ts_to_mp4()
+                                )  # ts_filepath is now self.ts_vod_fp
                             elif self.platform == "youtube":
-                                logger.info(f"Detached YouTube recording {self.current_vod_fp.name} completed. No conversion needed.")
+                                logger.info(
+                                    f"Detached YouTube recording {self.current_vod_fp.name} completed. No conversion needed."
+                                )
                 else:
                     self.detached_pid = None
                     self.detached_process_completed = False
@@ -419,16 +439,26 @@ class ChannelTask:
 
                 if live and ok and not self.is_recording():
                     await self._start_recording(self.current_title)
-                elif (not live or not ok) and self.is_recording(): # Stream ended or keyword no longer matches
-                    await self._stop_recording() # Stops streamlink process
+                elif (
+                    not live or not ok
+                ) and self.is_recording():  # Stream ended or keyword no longer matches
+                    reason = (
+                        "Stream went offline"
+                        if not live
+                        else "Keyword no longer matched"
+                    )
+                    await self._stop_recording(
+                        reason=reason
+                    )  # Stops streamlink process
 
-                    # For Twitch, if a .ts file was being recorded, schedule conversion
-                    if self.platform == "twitch" and self.conversion_pending and self.ts_vod_fp and self.ts_vod_fp.exists():
-                        logger.info(f"Twitch stream {self.name} ended. Scheduling TS to MP4 conversion for {self.ts_vod_fp.name}")
-                        asyncio.create_task(self._convert_ts_to_mp4())
-                    elif self.platform == "youtube" and self.mp4_vod_fp and self.mp4_vod_fp.exists():
-                        logger.info(f"YouTube stream {self.name} ended. VOD saved as {self.mp4_vod_fp.name}")
-                    self.conversion_pending = False # Reset pending status
+                    # Log the completed recording
+                    if self.vod_fp and self.vod_fp.exists():
+                        file_type = (
+                            ".ts file" if self.platform == "twitch" else ".mp4 file"
+                        )
+                        logger.info(
+                            f"{self.platform.capitalize()} stream {self.name} ended. VOD saved as {self.vod_fp.name} ({file_type})"
+                        )
 
                 if (
                     live
@@ -561,52 +591,50 @@ class ChannelTask:
 
         base_name_template = f"{day} {safe}"
         idx = 1
-        
+
         # Determine extension based on platform
         file_extension = ".ts" if self.platform == "twitch" else ".mp4"
 
         # Generate unique filename
         current_path_attempt = vod_dir / f"{base_name_template}{file_extension}"
-        while current_path_attempt.exists() or (self.platform == "twitch" and current_path_attempt.with_suffix(".mp4").exists()):
-            # For Twitch, also check if the .mp4 version exists to avoid issues if a .ts was orphaned
+        while current_path_attempt.exists():
             idx += 1
-            current_path_attempt = vod_dir / f"{base_name_template} ({idx}){file_extension}"
+            current_path_attempt = (
+                vod_dir / f"{base_name_template} ({idx}){file_extension}"
+            )
 
         final_vod_path = current_path_attempt
         log_fp = (log_dir / final_vod_path.stem).with_suffix(".log")
 
-        if self.platform == "twitch":
-            self.ts_vod_fp = final_vod_path
-            self.mp4_vod_fp = final_vod_path.with_suffix(".mp4")
-        else: # YouTube
-            self.ts_vod_fp = None # No intermediate .ts for YouTube
-            self.mp4_vod_fp = final_vod_path
-            
-        return final_vod_path, log_fp # final_vod_path is .ts for Twitch, .mp4 for YouTube
+        self.vod_fp = final_vod_path
+        return (
+            final_vod_path,
+            log_fp,
+        )  # final_vod_path is .ts for Twitch, .mp4 for YouTube
 
     async def _start_recording(self, title: str):
         # Always call _paths() to generate fresh paths for every new recording
-        logger.debug(f"[{self.platform}::{self.name}] Generating new file paths for recording")
+        logger.debug(
+            f"[{self.platform}::{self.name}] Generating new file paths for recording"
+        )
         self._paths(title)
-            
-        # self.current_vod_fp will be the file actively written to.
-        if self.platform == "twitch":
-            if not self.ts_vod_fp:
-                logger.error(f"[{self.platform}::{self.name}] ts_vod_fp not set before starting recording.")
-                return
-            self.current_vod_fp = self.ts_vod_fp
-            self.conversion_pending = True # Mark for potential conversion
-        elif self.platform == "youtube":
-            if not self.mp4_vod_fp:
-                logger.error(f"[{self.platform}::{self.name}] mp4_vod_fp not set before starting recording.")
-                return
-            self.current_vod_fp = self.mp4_vod_fp
-            self.conversion_pending = False # No conversion for YouTube
-        else:
-            logger.error(f"[{self.platform}::{self.name}] Unknown platform for recording.")
+
+        if not self.vod_fp:
+            logger.error(
+                f"[{self.platform}::{self.name}] vod_fp not set before starting recording."
+            )
             return
 
-        vod_fp, log_fp = self.current_vod_fp, (LOG_ROOT / self.name / self.current_vod_fp.stem).with_suffix(".log")
+        if self.platform not in ["twitch", "youtube"]:
+            logger.error(
+                f"[{self.platform}::{self.name}] Unknown platform for recording."
+            )
+            return
+
+        vod_fp, log_fp = (
+            self.vod_fp,
+            (LOG_ROOT / self.name / self.vod_fp.stem).with_suffix(".log"),
+        )
 
         """Start recording a live stream.
 
@@ -649,9 +677,12 @@ class ChannelTask:
                 "--twitch-disable-ads",
                 "-o",
                 str(vod_fp),
-                "--stream-segment-attempts", str(STREAMLINK_SEGMENT_ATTEMPTS),
-                "--stream-segment-timeout", str(STREAMLINK_SEGMENT_TIMEOUT),
-                "--stream-timeout", str(STREAMLINK_TIMEOUT),
+                "--stream-segment-attempts",
+                str(STREAMLINK_SEGMENT_ATTEMPTS),
+                "--stream-segment-timeout",
+                str(STREAMLINK_SEGMENT_TIMEOUT),
+                "--stream-timeout",
+                str(STREAMLINK_TIMEOUT),
             ]
 
         logger.info(f"START {self.platform}::{self.name} → {vod_fp.name}")
@@ -667,10 +698,10 @@ class ChannelTask:
         try:
             # Create parent directories if they don't exist
             log_fp.parent.mkdir(parents=True, exist_ok=True)
-            
+
             # Open the log file and keep the handle
             self.log_file_handle = open(log_fp, "a", encoding="utf-8")
-            
+
             # Write the initial log message
             self.log_file_handle.write(
                 f"{dt.datetime.now().isoformat()} START {title} for {self.platform}::{self.name} on VOD file {vod_fp.name}\n"
@@ -687,18 +718,21 @@ class ChannelTask:
 
         self.proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=self.log_file_handle if self.log_file_handle else subprocess.DEVNULL,
+            stdout=self.log_file_handle if self.log_file_handle else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
             text=False,
             preexec_fn=os.setsid,
         )
 
-    async def _stop_recording(self):
+    async def _stop_recording(self, reason: str = "Unknown reason"):
         """Stop an active recording process.
 
         Attempts to gracefully terminate the recording process. If the process
         doesn't exit within 10 seconds, it will be forcibly killed. Updates the
         process state to None after termination.
+
+        Args:
+            reason: The reason why the recording is being stopped, will be logged
         """
         # Logging for process state
         if self.proc is None:
@@ -707,7 +741,21 @@ class ChannelTask:
             )
             return
 
-        # Close the log file handle if it's open
+        process_id = self.proc.pid
+
+        # Write the termination reason to the log file before closing it
+        if self.log_file_handle is not None:
+            try:
+                timestamp = dt.datetime.now().isoformat()
+                self.log_file_handle.write(
+                    f"\n\n{timestamp} STOPPING RECORDING: {reason}\n"
+                )
+                self.log_file_handle.write(f"{timestamp} Process ID: {process_id}\n")
+                self.log_file_handle.flush()
+            except Exception as e:
+                logger.error(f"Error writing termination reason to log: {e}")
+
+        # Close the log file handle if it's open (but only after writing the reason)
         if self.log_file_handle is not None:
             try:
                 self.log_file_handle.close()
@@ -750,87 +798,6 @@ class ChannelTask:
             self.proc = None
         logger.debug(f"Process reference cleared for {self.platform}::{self.name}")
 
-    async def _convert_ts_to_mp4(self):
-        """Convert the current task's .ts file to .mp4 using FFmpeg. Only for Twitch."""
-        if self.platform != "twitch" or not self.ts_vod_fp:
-            logger.debug(f"_convert_ts_to_mp4 called for non-Twitch or missing ts_vod_fp for {self.name}. Skipping.")
-            return
-
-        ts_filepath = self.ts_vod_fp
-        mp4_filepath = self.mp4_vod_fp
-
-        if not ts_filepath.exists():
-            logger.error(f"TS file {ts_filepath} not found for conversion for {self.name}.")
-            self.conversion_last_status = "TS_MISSING"
-            return
-
-        if not mp4_filepath:
-            logger.error(f"MP4 output path not set for conversion of {ts_filepath.name} for {self.name}.")
-            self.conversion_last_status = "MP4_PATH_MISSING"
-            return
-
-        if mp4_filepath.exists():
-            logger.warning(
-                f"MP4 file {mp4_filepath.name} already exists. Skipping conversion for {ts_filepath.name} for {self.name}."
-            )
-            self.conversion_last_status = "MP4_EXISTS"
-            # As per user, verification script will handle .ts deletion if .mp4 is valid
-            return
-
-        logger.info(f"CONVERTING {ts_filepath.name} to {mp4_filepath.name} for {self.name}")
-        self.conversion_last_status = "CONVERTING"
-        """Convert a .ts file to .mp4 using FFmpeg."""
-        if not ts_filepath.exists():
-            logger.error(f"TS file {ts_filepath} not found for conversion.")
-            return
-
-        mp4_filepath = ts_filepath.with_suffix(".mp4")
-        if mp4_filepath.exists():
-            logger.warning(
-                f"MP4 file {mp4_filepath.name} already exists. Skipping conversion for {ts_filepath.name}."
-            )
-            # As per user, verification script will handle .ts deletion if .mp4 is valid
-            return
-
-        logger.info(f"CONVERTING {ts_filepath.name} to {mp4_filepath.name}")
-
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-i", str(ts_filepath),
-            "-c", "copy",
-            "-movflags", "+faststart",
-            str(mp4_filepath)
-        ]
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=subprocess.DEVNULL, # Suppress verbose FFmpeg output
-                stderr=subprocess.PIPE    # Capture stderr for error reporting
-            )
-            _, stderr_output = await proc.communicate() # Wait for FFmpeg to complete
-
-            if proc.returncode == 0:
-                logger.info(f"SUCCESS converting {ts_filepath.name} to {mp4_filepath.name} for {self.name}")
-                self.conversion_last_status = "SUCCESS"
-                # Original .ts file is NOT deleted here; verifications.py will handle it.
-                logger.info(f"Calling VOD file verification for channel {self.name} after successful conversion.")
-                try:
-                    await asyncio.to_thread(verify_vod_files, self.name)
-                except Exception as e_verify:
-                    logger.error(f"Error during VOD file verification for {self.name}: {e_verify}")
-            else:
-                error_message = stderr_output.decode(errors='ignore').strip()
-                logger.error(
-                    f"FAILED converting {ts_filepath.name} for {self.name} (FFmpeg exited with {proc.returncode}). Error: {error_message[:500]}..."
-                )
-                self.conversion_last_status = f"FAILED_CODE_{proc.returncode}"
-
-        except Exception as e:
-            logger.exception(f"Error during FFmpeg conversion for {ts_filepath.name} for {self.name}: {e}")
-            self.conversion_last_status = "EXCEPTION"
-
 
 # ───── Supervisor ───── #
 class Supervisor:
@@ -872,22 +839,25 @@ class Supervisor:
     async def _stop_all_tasks(self, delete_partials: bool):
         """Stop all tasks when no recordings are active."""
         await asyncio.gather(
-            *(task.stop(abort_recording=True, delete_partials=delete_partials) for task in self.tasks.values()),
+            *(
+                task.stop(abort_recording=True, delete_partials=delete_partials)
+                for task in self.tasks.values()
+            ),
             return_exceptions=True,
         )
 
     def _sort_tasks_by_recording_status(self, finish_recordings: bool):
         """Sort tasks into those to keep running and those to stop.
-        
+
         Args:
             finish_recordings: If True, allows active recordings to continue.
-        
+
         Returns:
             Tuple of (tasks_to_keep, tasks_to_stop)
         """
         to_keep = []
         to_stop = []
-        
+
         for task in self.tasks.values():
             if finish_recordings and task.is_recording():
                 to_keep.append(task)
@@ -900,28 +870,31 @@ class Supervisor:
                     )
                     # Make sure proc is None so we directly handle the detached process
                     task.proc = None
-                
+
         return to_keep, to_stop
 
     async def _stop_selected_tasks(self, tasks, delete_partials: bool):
         """Stop the specified tasks.
-        
+
         Args:
             tasks: List of tasks to stop
             delete_partials: If True, deletes partial VOD files when stopping recordings
         """
         await asyncio.gather(
-            *(task.stop(abort_recording=True, delete_partials=delete_partials) for task in tasks),
+            *(
+                task.stop(abort_recording=True, delete_partials=delete_partials)
+                for task in tasks
+            ),
             return_exceptions=True,
         )
 
     def _save_detached_process_data(self, task, pid):
         """Save information about a detached recording process.
-        
+
         Args:
             task: The channel task that will continue recording
             pid: Process ID of the recording process
-        
+
         Returns:
             True if the process data was saved successfully
         """
@@ -941,30 +914,28 @@ class Supervisor:
             "channel": task.name,
             "title": task.current_title,
             "keyword": task.keyword,
-            "vod_path": str(task.current_vod_fp)
-            if task.current_vod_fp
-            else None,
+            "vod_path": str(task.current_vod_fp) if task.current_vod_fp else None,
             "timestamp": dt.datetime.now().isoformat(),
         }
 
         data[key] = process_data
         DETACHED_FILE.write_text(json.dumps(data))
         task.detached_pid = pid
-        
+
         logger.info(f"  - {task.platform}::{task.name} - {task.current_title}")
         return True
 
     async def _handle_continued_recordings(self, tasks_to_keep):
         """Handle tasks that should continue recording in the background.
-        
+
         Args:
             tasks_to_keep: List of tasks to keep running
-        
+
         Returns:
             Number of recordings that will continue in the background
         """
         continued_count = 0
-        
+
         for task in tasks_to_keep:
             # Check if still recording after the other tasks were stopped
             if task.is_recording():
@@ -977,16 +948,18 @@ class Supervisor:
                 if pid:
                     if self._save_detached_process_data(task, pid):
                         continued_count += 1
-        
+
         # Cancel task loops but don't terminate the processes
         await asyncio.gather(
             *(task._stop_task_loop() for task in tasks_to_keep),
             return_exceptions=True,
         )
-        
+
         return continued_count
 
-    async def shutdown(self, finish_recordings: bool = False, delete_partials: bool = True):
+    async def shutdown(
+        self, finish_recordings: bool = False, delete_partials: bool = True
+    ):
         """Gracefully shut down the supervisor and all managed tasks.
 
         Cancels the reload and dashboard tasks, then handles all channel tasks
@@ -1190,7 +1163,7 @@ def main():
             .lower()
         )
         finish = ans == "" or ans == "y"
-        
+
         delete_partials = False
         if not finish:
             ans_delete = (
@@ -1199,8 +1172,10 @@ def main():
                 .lower()
             )
             delete_partials = ans_delete == "y"
-        
-        loop.run_until_complete(sup.shutdown(finish_recordings=finish, delete_partials=delete_partials))
+
+        loop.run_until_complete(
+            sup.shutdown(finish_recordings=finish, delete_partials=delete_partials)
+        )
     finally:
         loop.close()
         logger.info("Exited cleanly")

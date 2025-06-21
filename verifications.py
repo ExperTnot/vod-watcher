@@ -179,7 +179,9 @@ def verify_vod_files(channel_name: str):
 
     channel_vod_dir = VOD_ROOT / channel_name
     if not channel_vod_dir.exists() or not channel_vod_dir.is_dir():
-        logger.debug(f"VOD directory for channel {channel_name} not found at {channel_vod_dir}. Skipping VOD file verification.")
+        logger.debug(
+            f"VOD directory for channel {channel_name} not found at {channel_vod_dir}. Skipping VOD file verification."
+        )
         return
 
     logger.info(f"Verifying VOD files for channel: {channel_name} in {channel_vod_dir}")
@@ -190,11 +192,15 @@ def verify_vod_files(channel_name: str):
             ts_file = mp4_file.with_suffix(".ts")
 
             if ts_file.exists():
-                logger.debug(f"Found MP4: {mp4_file.name} and corresponding TS: {ts_file.name}")
+                logger.debug(
+                    f"Found MP4: {mp4_file.name} and corresponding TS: {ts_file.name}"
+                )
                 if is_mp4_valid(mp4_file):
                     try:
                         ts_file.unlink()
-                        logger.info(f"Deleted .ts file {ts_file.name} as valid .mp4 {mp4_file.name} exists.")
+                        logger.info(
+                            f"Deleted .ts file {ts_file.name} as valid .mp4 {mp4_file.name} exists."
+                        )
                     except OSError as e:
                         logger.error(f"Failed to delete .ts file {ts_file.name}: {e}")
                 else:
@@ -204,4 +210,3 @@ def verify_vod_files(channel_name: str):
             # else: MP4 exists, TS does not. This is normal for YouTube or already cleaned up Twitch VODs.
 
     logger.info(f"Finished VOD file verification for channel: {channel_name}")
-
