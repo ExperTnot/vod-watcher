@@ -122,6 +122,7 @@ class ChannelTask:
         self.proc: Optional[subprocess.Popen] = None
         self.ts_vod_fp: Optional[Path] = None  # For Twitch .ts files
         self.mp4_vod_fp: Optional[Path] = None # For final .mp4 files (Twitch converted, YouTube direct)
+        self.log_file_handle = None  # File handle for stderr logs
         self.conversion_pending: bool = False
         self.conversion_last_status: Optional[str] = None
 
@@ -655,18 +656,39 @@ class ChannelTask:
 
         logger.info(f"START {self.platform}::{self.name} → {vod_fp.name}")
 
+        # Close any existing log file handle first
+        if self.log_file_handle is not None:
+            try:
+                self.log_file_handle.close()
+            except Exception:
+                pass
+            self.log_file_handle = None
+
         try:
-            with open(log_fp, "a", encoding="utf-8") as lf:
-                lf.write(
-                    f"{dt.datetime.now().isoformat()} START {title} for {self.platform}::{self.name} on VOD file {vod_fp.name}\n"
-                )
+            # Create parent directories if they don't exist
+            log_fp.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Open the log file and keep the handle
+            self.log_file_handle = open(log_fp, "a", encoding="utf-8")
+            
+            # Write the initial log message
+            self.log_file_handle.write(
+                f"{dt.datetime.now().isoformat()} START {title} for {self.platform}::{self.name} on VOD file {vod_fp.name}\n"
+            )
+            self.log_file_handle.flush()
         except Exception as e:
             logger.error(f"Failed to write to stream log {log_fp}: {e}")
+            if self.log_file_handle is not None:
+                try:
+                    self.log_file_handle.close()
+                except Exception:
+                    pass
+                self.log_file_handle = None
 
         self.proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=log_fp,
+            stderr=self.log_file_handle if self.log_file_handle else subprocess.DEVNULL,
             text=False,
             preexec_fn=os.setsid,
         )
@@ -684,6 +706,14 @@ class ChannelTask:
                 f"Process for {self.platform}::{self.name} is already None, nothing to stop"
             )
             return
+
+        # Close the log file handle if it's open
+        if self.log_file_handle is not None:
+            try:
+                self.log_file_handle.close()
+            except Exception as e:
+                logger.error(f"Error closing log file: {e}")
+            self.log_file_handle = None
 
         poll_result = self.proc.poll()
         if poll_result is not None:
