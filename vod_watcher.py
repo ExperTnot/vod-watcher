@@ -67,6 +67,7 @@ MAX_YT_HEIGHT = 1080
 STREAMLINK_SEGMENT_ATTEMPTS = 10 # default is 3
 STREAMLINK_SEGMENT_TIMEOUT = 10 # default is 10
 STREAMLINK_TIMEOUT = 120 # default is 60
+YTDLT_ATTEMPTS = 15
 
 # ───── color and terminal setup ───── #
 USE_COLOR = sys.stdout.isatty() and ("TERM" in os.environ)
@@ -641,17 +642,27 @@ class ChannelTask:
         else:
             url = f"https://twitch.tv/{self.name}"
             cmd = [
-                "streamlink",
+                "yt-dlp",
                 url,
-                "best",
-                "--twitch-disable-hosting",
-                "--twitch-disable-ads",
                 "-o",
                 str(vod_fp),
-                "--stream-segment-attempts", str(STREAMLINK_SEGMENT_ATTEMPTS),
-                "--stream-segment-timeout", str(STREAMLINK_SEGMENT_TIMEOUT),
-                "--stream-timeout", str(STREAMLINK_TIMEOUT),
+                "--retries", str(YTDLT_ATTEMPTS),
+                "--fragment-retries", "infinite",
+                "--concurrent-fragments", "5",
             ]
+
+            # cmd = [
+            #     "streamlink",
+            #     url,
+            #     "best",
+            #     "--twitch-disable-hosting",
+            #     "--twitch-disable-ads",
+            #     "-o",
+            #     str(vod_fp),
+            #     "--stream-segment-attempts", str(STREAMLINK_SEGMENT_ATTEMPTS),
+            #     "--stream-segment-timeout", str(STREAMLINK_SEGMENT_TIMEOUT),
+            #     "--stream-timeout", str(STREAMLINK_TIMEOUT),
+            # ]
 
         logger.info(f"START {self.platform}::{self.name} → {vod_fp.name}")
 
@@ -721,13 +732,24 @@ class ChannelTask:
         logger.debug(f"Process reference cleared for {self.platform}::{self.name}")
 
     async def _convert_ts_to_mp4(self):
-        """Convert the current task's .ts file to .mp4 using FFmpeg. Only for Twitch."""
+        """Convert the current task's .ts file to .mp4 using FFmpeg and log file details.
+        
+        This method:
+        1. Logs duration and filetype of the .ts file using ffprobe
+        2. Converts .ts to .mp4 asynchronously using ffmpeg
+        3. Logs duration and filetype of the resulting .mp4 file
+        4. Deletes the .ts file if conversion was successful
+        """
         if self.platform != "twitch" or not self.ts_vod_fp:
             logger.debug(f"_convert_ts_to_mp4 called for non-Twitch or missing ts_vod_fp for {self.name}. Skipping.")
             return
 
         ts_filepath = self.ts_vod_fp
         mp4_filepath = self.mp4_vod_fp
+
+        # Get log file for this VOD
+        log_fp = (LOG_ROOT / self.name / ts_filepath.stem).with_suffix(".log")
+        log_fp.parent.mkdir(parents=True, exist_ok=True)
 
         if not ts_filepath.exists():
             logger.error(f"TS file {ts_filepath} not found for conversion for {self.name}.")
@@ -744,62 +766,155 @@ class ChannelTask:
                 f"MP4 file {mp4_filepath.name} already exists. Skipping conversion for {ts_filepath.name} for {self.name}."
             )
             self.conversion_last_status = "MP4_EXISTS"
-            # As per user, verification script will handle .ts deletion if .mp4 is valid
             return
 
         logger.info(f"CONVERTING {ts_filepath.name} to {mp4_filepath.name} for {self.name}")
         self.conversion_last_status = "CONVERTING"
-        """Convert a .ts file to .mp4 using FFmpeg."""
-        if not ts_filepath.exists():
-            logger.error(f"TS file {ts_filepath} not found for conversion.")
-            return
 
-        mp4_filepath = ts_filepath.with_suffix(".mp4")
-        if mp4_filepath.exists():
-            logger.warning(
-                f"MP4 file {mp4_filepath.name} already exists. Skipping conversion for {ts_filepath.name}."
-            )
-            # As per user, verification script will handle .ts deletion if .mp4 is valid
-            return
-
-        logger.info(f"CONVERTING {ts_filepath.name} to {mp4_filepath.name}")
-
+        # 1. Log source file details using ffprobe
+        await self._log_file_details(ts_filepath, log_fp, "TS SOURCE FILE")
+        
+        # 2. Convert the file
         cmd = [
             "ffmpeg",
             "-hide_banner",
             "-i", str(ts_filepath),
-            "-c", "copy",
-            "-movflags", "+faststart",
+            "-c", "copy",  # Just copy streams without re-encoding
+            "-movflags", "+faststart",  # Optimize for web streaming
             str(mp4_filepath)
         ]
 
         try:
+            with open(log_fp, "a", encoding="utf-8") as lf:
+                lf.write(f"{dt.datetime.now().isoformat()} FFMPEG CONVERSION STARTED: {ts_filepath.name} → {mp4_filepath.name}\n")
+                lf.write(f"Command: {' '.join(cmd)}\n")
+            
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=subprocess.DEVNULL, # Suppress verbose FFmpeg output
-                stderr=subprocess.PIPE    # Capture stderr for error reporting
+                stdout=subprocess.DEVNULL,  # Suppress verbose FFmpeg output
+                stderr=subprocess.PIPE      # Capture stderr for error reporting
             )
-            _, stderr_output = await proc.communicate() # Wait for FFmpeg to complete
+            _, stderr_output = await proc.communicate()  # Wait for FFmpeg to complete
 
             if proc.returncode == 0:
+                # 3. Log successful conversion and output file details
                 logger.info(f"SUCCESS converting {ts_filepath.name} to {mp4_filepath.name} for {self.name}")
+                with open(log_fp, "a", encoding="utf-8") as lf:
+                    lf.write(f"{dt.datetime.now().isoformat()} FFMPEG CONVERSION SUCCESS\n")
+                
+                # Log the output MP4 file details
+                await self._log_file_details(mp4_filepath, log_fp, "MP4 OUTPUT FILE")
+                
                 self.conversion_last_status = "SUCCESS"
-                # Original .ts file is NOT deleted here; verifications.py will handle it.
-                logger.info(f"Calling VOD file verification for channel {self.name} after successful conversion.")
-                try:
-                    await asyncio.to_thread(verify_vod_files, self.name)
-                except Exception as e_verify:
-                    logger.error(f"Error during VOD file verification for {self.name}: {e_verify}")
+                
+                # 4. Delete the original .ts file
+                if ts_filepath.exists():
+                    try:
+                        ts_filepath.unlink()
+                        logger.info(f"Deleted original .ts file: {ts_filepath.name}")
+                        with open(log_fp, "a", encoding="utf-8") as lf:
+                            lf.write(f"{dt.datetime.now().isoformat()} DELETED ORIGINAL TS FILE: {ts_filepath.name}\n")
+                    except Exception as e_del:
+                        logger.error(f"Failed to delete original .ts file {ts_filepath}: {e_del}")
+                        with open(log_fp, "a", encoding="utf-8") as lf:
+                            lf.write(f"{dt.datetime.now().isoformat()} ERROR DELETING TS FILE: {str(e_del)}\n")
             else:
+                # Log conversion failure
                 error_message = stderr_output.decode(errors='ignore').strip()
                 logger.error(
                     f"FAILED converting {ts_filepath.name} for {self.name} (FFmpeg exited with {proc.returncode}). Error: {error_message[:500]}..."
                 )
+                with open(log_fp, "a", encoding="utf-8") as lf:
+                    lf.write(f"{dt.datetime.now().isoformat()} FFMPEG CONVERSION FAILED (exit code {proc.returncode})\n")
+                    lf.write(f"Error: {error_message}\n")
                 self.conversion_last_status = f"FAILED_CODE_{proc.returncode}"
 
         except Exception as e:
             logger.exception(f"Error during FFmpeg conversion for {ts_filepath.name} for {self.name}: {e}")
+            with open(log_fp, "a", encoding="utf-8") as lf:
+                lf.write(f"{dt.datetime.now().isoformat()} EXCEPTION DURING CONVERSION: {str(e)}\n")
             self.conversion_last_status = "EXCEPTION"
+            
+    async def _log_file_details(self, file_path: Path, log_file: Path, header: str):
+        """Log file details using ffprobe.
+        
+        Args:
+            file_path: Path to the file to analyze
+            log_file: Path to the log file to write to
+            header: Header description for the log entry
+        """
+        if not file_path.exists():
+            logger.error(f"Cannot log details for non-existent file: {file_path}")
+            return
+            
+        try:
+            # Get file info using ffprobe
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=filename,format_name,duration,size,bit_rate",
+                "-show_entries", "stream=codec_name,codec_type,width,height,bit_rate,sample_rate",
+                "-of", "json",
+                str(file_path)
+            ]
+            
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            
+            if proc.returncode == 0:
+                # Parse the JSON output
+                probe_data = json.loads(stdout)
+                
+                with open(log_file, "a", encoding="utf-8") as lf:
+                    lf.write(f"{dt.datetime.now().isoformat()} {header} DETAILS:\n")
+                    
+                    # Format size in human-readable format
+                    size_bytes = int(probe_data.get('format', {}).get('size', 0))
+                    size_mb = size_bytes / (1024 * 1024)
+                    size_gb = size_mb / 1024
+                    
+                    # Log format information
+                    format_info = probe_data.get('format', {})
+                    lf.write(f"Filename: {file_path.name}\n")
+                    lf.write(f"Format: {format_info.get('format_name', 'unknown')}\n")
+                    lf.write(f"Duration: {format_info.get('duration', 'unknown')} seconds\n")
+                    lf.write(f"Size: {size_gb:.2f} GB ({size_bytes} bytes)\n")
+                    lf.write(f"Bitrate: {format_info.get('bit_rate', 'unknown')} bps\n")
+                    
+                    # Log stream information
+                    lf.write("Streams:\n")
+                    for i, stream in enumerate(probe_data.get('streams', [])):
+                        codec_type = stream.get('codec_type', 'unknown')
+                        codec_name = stream.get('codec_name', 'unknown')
+                        lf.write(f"  Stream #{i}: {codec_type} ({codec_name})")
+                        
+                        if codec_type == 'video':
+                            width = stream.get('width', 'unknown')
+                            height = stream.get('height', 'unknown')
+                            lf.write(f", {width}x{height}")
+                            
+                        if codec_type == 'audio':
+                            sample_rate = stream.get('sample_rate', 'unknown')
+                            lf.write(f", {sample_rate} Hz")
+                            
+                        lf.write("\n")
+                    
+                    lf.write("\n")
+                logger.debug(f"Logged file details for {file_path.name}")
+            else:
+                error = stderr.decode(errors='ignore').strip()
+                logger.error(f"ffprobe failed for {file_path.name}: {error}")
+                with open(log_file, "a", encoding="utf-8") as lf:
+                    lf.write(f"{dt.datetime.now().isoformat()} FFPROBE FAILED: {error}\n")
+                    
+        except Exception as e:
+            logger.error(f"Error logging file details for {file_path.name}: {e}")
+            with open(log_file, "a", encoding="utf-8") as lf:
+                lf.write(f"{dt.datetime.now().isoformat()} ERROR LOGGING FILE DETAILS: {str(e)}\n")
 
 
 # ───── Supervisor ───── #
