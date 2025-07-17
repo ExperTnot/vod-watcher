@@ -48,6 +48,8 @@ from utils import (
     wait_for_platform_slot,
     yt_live_url,
     strip_end_date_time,
+    log_new_line_file,
+    get_video_duration,
 )
 
 
@@ -65,23 +67,24 @@ PROBE_INTERVAL = max(45, PROBE_INTERVAL)
 PLATFORM_COOLDOWN = max(20, PLATFORM_COOLDOWN)
 MAX_YT_HEIGHT = 1080
 
-STREAMLINK_SEGMENT_ATTEMPTS = 10 # default is 3
-STREAMLINK_SEGMENT_TIMEOUT = 30 # default is 10
-STREAMLINK_TIMEOUT = 120 # default is 60
+STREAMLINK_SEGMENT_ATTEMPTS = 10  # default is 3
+STREAMLINK_SEGMENT_TIMEOUT = 30  # default is 10
+STREAMLINK_TIMEOUT = 120  # default is 60
 YTDLT_ATTEMPTS = 15
 
 # ───── color and terminal setup ───── #
 USE_COLOR = sys.stdout.isatty() and ("TERM" in os.environ)
 if USE_COLOR:
-    RED, YELLOW, GREEN, BLUE, RESET = (
+    RED, YELLOW, GREEN, BLUE, MAGENTA, RESET = (
         "\033[91m",
         "\033[93m",
         "\033[92m",
         "\033[94m",
+        "\033[95m",
         "\033[0m",
     )
 else:
-    RED = YELLOW = GREEN = BLUE = RESET = ""
+    RED = YELLOW = GREEN = BLUE = MAGENTA = RESET = ""
 
 CURSOR_HOME = "\033[H"  # Move cursor to top left
 ERASE_DOWN = "\033[J"  # Erase from cursor to end of screen
@@ -122,9 +125,6 @@ class ChannelTask:
         self.name = name.strip()
         self.keyword = keyword.lower().strip()
         self.proc: Optional[subprocess.Popen] = None
-        self.vod_fp: Optional[Path] = (
-            None  # Path to the VOD file (.ts for Twitch, .mp4 for YouTube)
-        )
         self.log_file_handle = None  # File handle for stderr logs
 
         self.current_title: str = "<awaiting check>"
@@ -136,9 +136,21 @@ class ChannelTask:
         _spawn_count[self.platform] += 1
         self.next_probe = time.time() + idx * PLATFORM_COOLDOWN
         self.loop: Optional[asyncio.Task] = None
-        # self.current_vod_fp will point to the active recording file (.ts for Twitch, .mp4 for YouTube)
-        self.current_vod_fp: Optional[Path] = None
         self.detached_pid: Optional[int] = None
+
+        # Recording file paths - simplified
+        self.current_vod_fp: Optional[Path] = (
+            None  # Active recording file (.ts for Twitch, .mp4 for YouTube)
+        )
+        self.final_vod_fp: Optional[Path] = (
+            None  # Final output file (.mp4 for both platforms)
+        )
+
+        # Conversion state for Twitch TS->MP4
+        self.conversion_pending: bool = False
+        self.conversion_last_status: str = "NONE"
+        self.conversion_process: Optional[asyncio.subprocess.Process] = None
+
         self._load_detached()
 
     def start(self):
@@ -276,10 +288,9 @@ class ChannelTask:
 
         self.proc = None
         self.current_vod_fp = None
-        self.ts_vod_fp = None
-        self.mp4_vod_fp = None
+        self.final_vod_fp = None
         self.conversion_pending = False
-        self.conversion_last_status = None
+        self.conversion_last_status = "NONE"
 
     def _load_detached(self):
         """Load information about previously detached recording processes.
@@ -303,12 +314,11 @@ class ChannelTask:
                         loaded_path = Path(process_data["vod_path"])
                         self.current_vod_fp = loaded_path
                         if self.platform == "twitch" and loaded_path.suffix == ".ts":
-                            self.ts_vod_fp = loaded_path
-                            self.mp4_vod_fp = loaded_path.with_suffix(".mp4")
+                            self.final_vod_fp = loaded_path.with_suffix(".mp4")
                         elif (
                             self.platform == "youtube" and loaded_path.suffix == ".mp4"
                         ):
-                            self.mp4_vod_fp = loaded_path
+                            self.final_vod_fp = loaded_path
                     self.detached_data = process_data
                 elif isinstance(process_data, int):
                     pid = process_data
@@ -332,44 +342,35 @@ class ChannelTask:
                         )
                         # If the completed VOD is a .ts file, schedule it for conversion
                         if (
-                            self.detached_process_completed
-                            and self.current_vod_fp
-                            and self.current_vod_fp.exists()
+                            self.platform == "twitch"
                             and self.current_vod_fp.suffix == ".ts"
-                        ):
+                        ):  # Only convert if it's a Twitch .ts file
                             logger.info(
-                                f"Detached recording {self.current_vod_fp.name} completed. Scheduling conversion."
+                                f"Detached Twitch recording {self.current_vod_fp.name} completed. Scheduling conversion."
                             )
-                            if (
-                                self.platform == "twitch"
-                                and self.current_vod_fp.suffix == ".ts"
-                            ):  # Only convert if it's a Twitch .ts file
-                                logger.info(
-                                    f"Detached Twitch recording {self.current_vod_fp.name} completed. Scheduling conversion."
-                                )
-                                self.conversion_pending = True  # Mark for conversion
-                                # Clean up the entry from detached file to prevent re-processing
-                                if DETACHED_FILE.exists():
-                                    try:
-                                        _data = json.loads(DETACHED_FILE.read_text())
-                                        _key = f"{self.platform}::{self.name.lower()}"
-                                        if _key in _data:
-                                            _data.pop(_key)
-                                            DETACHED_FILE.write_text(json.dumps(_data))
-                                            logger.debug(
-                                                f"Removed {_key} from detached processes file after scheduling conversion."
-                                            )
-                                    except Exception as e_json:
-                                        logger.warning(
-                                            f"Failed to update detached process file for {_key} after scheduling conversion: {e_json}"
+                            self.conversion_pending = True  # Mark for conversion
+                            # Clean up the entry from detached file to prevent re-processing
+                            if DETACHED_FILE.exists():
+                                try:
+                                    _data = json.loads(DETACHED_FILE.read_text())
+                                    _key = f"{self.platform}::{self.name.lower()}"
+                                    if _key in _data:
+                                        _data.pop(_key)
+                                        DETACHED_FILE.write_text(json.dumps(_data))
+                                        logger.debug(
+                                            f"Removed {_key} from detached processes file after scheduling conversion."
                                         )
-                                asyncio.create_task(
-                                    self._convert_ts_to_mp4()
-                                )  # ts_filepath is now self.ts_vod_fp
-                            elif self.platform == "youtube":
-                                logger.info(
-                                    f"Detached YouTube recording {self.current_vod_fp.name} completed. No conversion needed."
-                                )
+                                except Exception as e_json:
+                                    logger.warning(
+                                        f"Failed to update detached process file for {_key} after scheduling conversion: {e_json}"
+                                    )
+                            asyncio.create_task(
+                                self._convert_ts_to_mp4()
+                            )  # ts_filepath is now self.ts_vod_fp
+                        elif self.platform == "youtube":
+                            logger.info(
+                                f"Detached YouTube recording {self.current_vod_fp.name} completed. No conversion needed."
+                            )
                 else:
                     self.detached_pid = None
                     self.detached_process_completed = False
@@ -453,14 +454,22 @@ class ChannelTask:
                         reason=reason
                     )  # Stops streamlink process
 
-                    # Log the completed recording
-                    if self.vod_fp and self.vod_fp.exists():
+                    # Log the completed recording and trigger conversion for Twitch
+                    if self.current_vod_fp and self.current_vod_fp.exists():
                         file_type = (
                             ".ts file" if self.platform == "twitch" else ".mp4 file"
                         )
                         logger.info(
-                            f"{self.platform.capitalize()} stream {self.name} ended. VOD saved as {self.vod_fp.name} ({file_type})"
+                            f"{self.platform.capitalize()} stream {self.name} ended. VOD saved as {self.current_vod_fp.name} ({file_type})"
                         )
+
+                        # Schedule TS to MP4 conversion
+                        if self.platform == "twitch":
+                            logger.debug(
+                                f"Scheduling TS to MP4 conversion for {self.current_vod_fp.name}"
+                            )
+                            self.conversion_pending = True
+                            asyncio.create_task(self._convert_ts_to_mp4())
 
                 if (
                     live
@@ -581,38 +590,37 @@ class ChannelTask:
             - Path: Path to the VOD file (.mp4)
             - Path: Path to the log file (.log)
         """
-        title = strip_end_date_time(title)
-        safe_raw = title.strip()
-        safe = "".join(ch if ch not in (os.sep, "\0") else "_" for ch in safe_raw)
-        safe = safe[:150].strip() or "live"
+        title = strip_end_date_time(title).strip()
+        safe = (
+            "".join(ch if ch not in (os.sep, "\0") else "_" for ch in title) or "live"
+        )
         day = dt.datetime.now().strftime("%Y-%m-%d")
+
         vod_dir = VOD_ROOT / self.name
         log_dir = LOG_ROOT / self.name
         vod_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        base_name_template = f"{day} {safe}"
-        idx = 1
+        # File extension and base name
+        is_twitch = self.platform == "twitch"
+        ext = ".ts" if is_twitch else ".mp4"
+        base = f"{day} {safe}"
 
-        # Determine extension based on platform
-        file_extension = ".ts" if self.platform == "twitch" else ".mp4"
+        # Generate unique VOD filename
+        for idx in range(1, 100):  # Cap at 99 variations to avoid infinite loops
+            name = f"{base}{ext}" if idx == 1 else f"{base} ({idx}){ext}"
+            vod_fp = vod_dir / name
+            if not vod_fp.exists():
+                break
 
-        # Generate unique filename
-        current_path_attempt = vod_dir / f"{base_name_template}{file_extension}"
-        while current_path_attempt.exists():
-            idx += 1
-            current_path_attempt = (
-                vod_dir / f"{base_name_template} ({idx}){file_extension}"
-            )
+        # Log file path (same stem, different dir)
+        log_fp = log_dir / f"{vod_fp.stem}.log"
 
-        final_vod_path = current_path_attempt
-        log_fp = (log_dir / final_vod_path.stem).with_suffix(".log")
+        # Set current and final VOD paths
+        self.current_vod_fp = vod_fp
+        self.final_vod_fp = vod_fp.with_suffix(".mp4") if is_twitch else vod_fp
 
-        self.vod_fp = final_vod_path
-        return (
-            final_vod_path,
-            log_fp,
-        )  # final_vod_path is .ts for Twitch, .mp4 for YouTube
+        return vod_fp, log_fp
 
     async def _start_recording(self, title: str):
         # Always call _paths() to generate fresh paths for every new recording
@@ -621,9 +629,9 @@ class ChannelTask:
         )
         self._paths(title)
 
-        if not self.vod_fp:
+        if not self.current_vod_fp:
             logger.error(
-                f"[{self.platform}::{self.name}] vod_fp not set before starting recording."
+                f"[{self.platform}::{self.name}] current_vod_fp not set before starting recording."
             )
             return
 
@@ -634,8 +642,8 @@ class ChannelTask:
             return
 
         vod_fp, log_fp = (
-            self.vod_fp,
-            (LOG_ROOT / self.name / self.vod_fp.stem).with_suffix(".log"),
+            self.current_vod_fp,
+            (LOG_ROOT / self.name / self.current_vod_fp.stem).with_suffix(".log"),
         )
 
         """Start recording a live stream.
@@ -679,14 +687,19 @@ class ChannelTask:
                 "--twitch-disable-hosting",
                 "-o",
                 str(vod_fp),
-                "--hls-segment-attempts", str(STREAMLINK_SEGMENT_ATTEMPTS),
-                "--hls-segment-timeout", str(STREAMLINK_SEGMENT_TIMEOUT),
-                "--hls-timeout", str(STREAMLINK_TIMEOUT),
+                "--hls-segment-attempts",
+                str(STREAMLINK_SEGMENT_ATTEMPTS),
+                "--hls-segment-timeout",
+                str(STREAMLINK_SEGMENT_TIMEOUT),
+                "--hls-timeout",
+                str(STREAMLINK_TIMEOUT),
             ]
-            
+
             # Add OAuth token if provided to prevent ads and stream discontinuities
             if TWITCH_OAUTH_TOKEN:
-                cmd.extend(["--twitch-api-header", f"Authorization=OAuth {TWITCH_OAUTH_TOKEN}"])
+                cmd.extend(
+                    ["--twitch-api-header", f"Authorization=OAuth {TWITCH_OAUTH_TOKEN}"]
+                )
 
         logger.info(f"START {self.platform}::{self.name} → {vod_fp.name}")
 
@@ -802,32 +815,35 @@ class ChannelTask:
         logger.debug(f"Process reference cleared for {self.platform}::{self.name}")
 
     async def _convert_ts_to_mp4(self):
-        """Convert the current task's .ts file to .mp4 using FFmpeg and log file details.
-        
-        This method:
-        1. Logs duration and filetype of the .ts file using ffprobe
-        2. Converts .ts to .mp4 asynchronously using ffmpeg
-        3. Logs duration and filetype of the resulting .mp4 file
-        4. Deletes the .ts file if conversion was successful
+        """Convert the current task's .ts file to .mp4 using FFmpeg.
+
+        Only logs errors. Sets conversion_pending during actual conversion process.
+        Deletes the .ts file if conversion was successful.
         """
-        if self.platform != "twitch" or not self.ts_vod_fp:
-            logger.debug(f"_convert_ts_to_mp4 called for non-Twitch or missing ts_vod_fp for {self.name}. Skipping.")
+        if self.platform != "twitch" or not self.current_vod_fp:
+            logger.debug(
+                f"_convert_ts_to_mp4 called for non-Twitch or missing current_vod_fp for {self.name}. Skipping."
+            )
             return
 
-        ts_filepath = self.ts_vod_fp
-        mp4_filepath = self.mp4_vod_fp
+        ts_filepath = self.current_vod_fp
+        mp4_filepath = self.final_vod_fp
 
         # Get log file for this VOD
         log_fp = (LOG_ROOT / self.name / ts_filepath.stem).with_suffix(".log")
         log_fp.parent.mkdir(parents=True, exist_ok=True)
 
         if not ts_filepath.exists():
-            logger.error(f"TS file {ts_filepath} not found for conversion for {self.name}.")
+            logger.error(
+                f"TS file {ts_filepath} not found for conversion for {self.name}."
+            )
             self.conversion_last_status = "TS_MISSING"
             return
 
         if not mp4_filepath:
-            logger.error(f"MP4 output path not set for conversion of {ts_filepath.name} for {self.name}.")
+            logger.error(
+                f"MP4 output path not set for conversion of {ts_filepath.name} for {self.name}."
+            )
             self.conversion_last_status = "MP4_PATH_MISSING"
             return
 
@@ -838,153 +854,116 @@ class ChannelTask:
             self.conversion_last_status = "MP4_EXISTS"
             return
 
-        logger.info(f"CONVERTING {ts_filepath.name} to {mp4_filepath.name} for {self.name}")
+        logger.info(
+            f"CONVERTING {ts_filepath.name} to {mp4_filepath.name} for {self.name}"
+        )
         self.conversion_last_status = "CONVERTING"
 
-        # 1. Log source file details using ffprobe
-        await self._log_file_details(ts_filepath, log_fp, "TS SOURCE FILE")
-        
-        # 2. Convert the file
+        # Convert the file with minimal logging
         cmd = [
             "ffmpeg",
             "-hide_banner",
-            "-i", str(ts_filepath),
-            "-c", "copy",  # Just copy streams without re-encoding
-            "-movflags", "+faststart",  # Optimize for web streaming
-            str(mp4_filepath)
+            "-loglevel",
+            "error",  # Only show errors
+            "-i",
+            str(ts_filepath),
+            "-c",
+            "copy",  # Just copy streams without re-encoding
+            "-movflags",
+            "+faststart",  # Optimize for web streaming
+            str(mp4_filepath),
         ]
 
         try:
-            with open(log_fp, "a", encoding="utf-8") as lf:
-                lf.write(f"{dt.datetime.now().isoformat()} FFMPEG CONVERSION STARTED: {ts_filepath.name} → {mp4_filepath.name}\n")
-                lf.write(f"Command: {' '.join(cmd)}\n")
-            
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=subprocess.DEVNULL,  # Suppress verbose FFmpeg output
-                stderr=subprocess.PIPE      # Capture stderr for error reporting
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid,
             )
-            _, stderr_output = await proc.communicate()  # Wait for FFmpeg to complete
+            self.conversion_process = proc  # Track the process for potential detachment
+            _, stderr_output = await proc.communicate()
 
             if proc.returncode == 0:
-                # 3. Log successful conversion and output file details
-                logger.info(f"SUCCESS converting {ts_filepath.name} to {mp4_filepath.name} for {self.name}")
-                with open(log_fp, "a", encoding="utf-8") as lf:
-                    lf.write(f"{dt.datetime.now().isoformat()} FFMPEG CONVERSION SUCCESS\n")
-                
-                # Log the output MP4 file details
-                await self._log_file_details(mp4_filepath, log_fp, "MP4 OUTPUT FILE")
-                
+                logger.info(
+                    f"SUCCESS converting {ts_filepath.name} to {mp4_filepath.name} for {self.name}"
+                )
                 self.conversion_last_status = "SUCCESS"
-                
-                # 4. Delete the original .ts file
+                log_new_line_file(log_fp, "FFMPEG CONVERSION SUCCESS")
+
+                # Check durations before deleting TS file
+                ts_duration = await get_video_duration(ts_filepath)
+                mp4_duration = await get_video_duration(mp4_filepath)
+
+                if ts_duration is not None and mp4_duration is not None:
+                    duration_diff = ts_duration - mp4_duration
+                    ts_hours = ts_duration / 3600
+
+                    # Format durations for logging
+                    ts_time = f"{int(ts_duration // 3600):02d}:{int((ts_duration % 3600) // 60):02d}:{int(ts_duration % 60):02d}"
+                    mp4_time = f"{int(mp4_duration // 3600):02d}:{int((mp4_duration % 3600) // 60):02d}:{int(mp4_duration % 60):02d}"
+                    diff_time = f"{int(abs(duration_diff) // 60):02d}:{int(abs(duration_diff) % 60):02d}"
+
+                    # Check if OAuth token is available
+                    has_oauth = (
+                        bool(TWITCH_OAUTH_TOKEN.strip())
+                        if TWITCH_OAUTH_TOKEN
+                        else False
+                    )
+                    oauth_status = "OAuth: YES" if has_oauth else "OAuth: NO"
+
+                    # Log duration comparison
+                    log_new_line_file(
+                        log_fp,
+                        f"DURATION CHECK - TS: {ts_time}, MP4: {mp4_time}, Diff: {diff_time}, {oauth_status}",
+                    )
+
+                    # Check if difference is over 75 seconds per hour (1.25 minutes per hour)
+                    if ts_hours > 0 and (duration_diff / ts_hours) > 75:
+                        warning_msg = f"Time difference over 1.25 min per hour. If you don't have an OAuth token setup with Twitch Turbo or are subbed to {self.name} then this is expected and can't be prevented."
+                        log_new_line_file(log_fp, f"WARNING: {warning_msg}")
+                        logger.warning(
+                            f"Large duration difference for {self.name}: {warning_msg}"
+                        )
+                else:
+                    log_new_line_file(
+                        log_fp, "DURATION CHECK - Unable to determine file durations"
+                    )
+
+                # Delete the original .ts file
                 if ts_filepath.exists():
                     try:
-                        ts_filepath.unlink()
+                        ts_filepath.unlink(missing_ok=True)
                         logger.info(f"Deleted original .ts file: {ts_filepath.name}")
-                        with open(log_fp, "a", encoding="utf-8") as lf:
-                            lf.write(f"{dt.datetime.now().isoformat()} DELETED ORIGINAL TS FILE: {ts_filepath.name}\n")
+                        log_new_line_file(
+                            log_fp, f"DELETED ORIGINAL TS FILE: {ts_filepath.name}"
+                        )
                     except Exception as e_del:
-                        logger.error(f"Failed to delete original .ts file {ts_filepath}: {e_del}")
-                        with open(log_fp, "a", encoding="utf-8") as lf:
-                            lf.write(f"{dt.datetime.now().isoformat()} ERROR DELETING TS FILE: {str(e_del)}\n")
+                        logger.error(
+                            f"Failed to delete original .ts file {ts_filepath}: {e_del}"
+                        )
+                        log_new_line_file(
+                            log_fp, f"ERROR DELETING TS FILE: {str(e_del)}"
+                        )
             else:
                 # Log conversion failure
-                error_message = stderr_output.decode(errors='ignore').strip()
+                error_message = stderr_output.decode(errors="ignore").strip()
                 logger.error(
-                    f"FAILED converting {ts_filepath.name} for {self.name} (FFmpeg exited with {proc.returncode}). Error: {error_message[:500]}..."
+                    f"FAILED converting {ts_filepath.name} for {self.name} (FFmpeg exited with {proc.returncode}).\nError: {error_message}"
                 )
-                with open(log_fp, "a", encoding="utf-8") as lf:
-                    lf.write(f"{dt.datetime.now().isoformat()} FFMPEG CONVERSION FAILED (exit code {proc.returncode})\n")
-                    lf.write(f"Error: {error_message}\n")
+                log_new_line_file(log_fp, f"ERROR CONVERTING: {error_message}")
                 self.conversion_last_status = f"FAILED_CODE_{proc.returncode}"
 
         except Exception as e:
-            logger.exception(f"Error during FFmpeg conversion for {ts_filepath.name} for {self.name}: {e}")
-            with open(log_fp, "a", encoding="utf-8") as lf:
-                lf.write(f"{dt.datetime.now().isoformat()} EXCEPTION DURING CONVERSION: {str(e)}\n")
-            self.conversion_last_status = "EXCEPTION"
-            
-    async def _log_file_details(self, file_path: Path, log_file: Path, header: str):
-        """Log file details using ffprobe.
-        
-        Args:
-            file_path: Path to the file to analyze
-            log_file: Path to the log file to write to
-            header: Header description for the log entry
-        """
-        if not file_path.exists():
-            logger.error(f"Cannot log details for non-existent file: {file_path}")
-            return
-            
-        try:
-            # Get file info using ffprobe
-            cmd = [
-                "ffprobe",
-                "-v", "error",
-                "-show_entries", "format=filename,format_name,duration,size,bit_rate",
-                "-show_entries", "stream=codec_name,codec_type,width,height,bit_rate,sample_rate",
-                "-of", "json",
-                str(file_path)
-            ]
-            
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+            logger.error(
+                f"Error during FFmpeg conversion for {ts_filepath.name} for {self.name}: {e}"
             )
-            stdout, stderr = await proc.communicate()
-            
-            if proc.returncode == 0:
-                # Parse the JSON output
-                probe_data = json.loads(stdout)
-                
-                with open(log_file, "a", encoding="utf-8") as lf:
-                    lf.write(f"{dt.datetime.now().isoformat()} {header} DETAILS:\n")
-                    
-                    # Format size in human-readable format
-                    size_bytes = int(probe_data.get('format', {}).get('size', 0))
-                    size_mb = size_bytes / (1024 * 1024)
-                    size_gb = size_mb / 1024
-                    
-                    # Log format information
-                    format_info = probe_data.get('format', {})
-                    lf.write(f"Filename: {file_path.name}\n")
-                    lf.write(f"Format: {format_info.get('format_name', 'unknown')}\n")
-                    lf.write(f"Duration: {format_info.get('duration', 'unknown')} seconds\n")
-                    lf.write(f"Size: {size_gb:.2f} GB ({size_bytes} bytes)\n")
-                    lf.write(f"Bitrate: {format_info.get('bit_rate', 'unknown')} bps\n")
-                    
-                    # Log stream information
-                    lf.write("Streams:\n")
-                    for i, stream in enumerate(probe_data.get('streams', [])):
-                        codec_type = stream.get('codec_type', 'unknown')
-                        codec_name = stream.get('codec_name', 'unknown')
-                        lf.write(f"  Stream #{i}: {codec_type} ({codec_name})")
-                        
-                        if codec_type == 'video':
-                            width = stream.get('width', 'unknown')
-                            height = stream.get('height', 'unknown')
-                            lf.write(f", {width}x{height}")
-                            
-                        if codec_type == 'audio':
-                            sample_rate = stream.get('sample_rate', 'unknown')
-                            lf.write(f", {sample_rate} Hz")
-                            
-                        lf.write("\n")
-                    
-                    lf.write("\n")
-                logger.debug(f"Logged file details for {file_path.name}")
-            else:
-                error = stderr.decode(errors='ignore').strip()
-                logger.error(f"ffprobe failed for {file_path.name}: {error}")
-                with open(log_file, "a", encoding="utf-8") as lf:
-                    lf.write(f"{dt.datetime.now().isoformat()} FFPROBE FAILED: {error}\n")
-                    
-        except Exception as e:
-            logger.error(f"Error logging file details for {file_path.name}: {e}")
-            with open(log_file, "a", encoding="utf-8") as lf:
-                lf.write(f"{dt.datetime.now().isoformat()} ERROR LOGGING FILE DETAILS: {str(e)}\n")
+            log_new_line_file(log_fp, f"ERROR CONVERTING: {str(e)}")
+            self.conversion_last_status = "EXCEPTION"
+        finally:
+            # Clear conversion_pending flag when conversion is done
+            self.conversion_pending = False
+            self.conversion_process = None
 
 
 # ───── Supervisor ───── #
@@ -1076,6 +1055,49 @@ class Supervisor:
             return_exceptions=True,
         )
 
+    def _detach_conversion_processes(self) -> int:
+        """Ensure any unfinished TS to MP4 conversions continue after shutdown.
+
+        Behaviour:
+            If a ChannelTask has an active conversion process, it is left running
+            and the reference to it is dropped.
+
+        Returns:
+            The total number of FFmpeg processes left running
+        """
+        detached_count = 0
+
+        for task in self.tasks.values():
+            if task.platform != "twitch":
+                continue  # Only relevant for Twitch VOD tasks
+
+            ts_fp = task.current_vod_fp
+            mp4_fp = task.final_vod_fp
+
+            if not ts_fp or ts_fp.suffix != ".ts" or not ts_fp.exists():
+                continue  # Nothing to convert
+
+            if mp4_fp and mp4_fp.exists():
+                continue  # Already converted
+
+            if task.conversion_process and task.conversion_process.returncode is None:
+                logger.info(
+                    f"Leaving existing FFmpeg conversion running for {task.name}: PID={task.conversion_process.pid}"
+                )
+                detached_count += 1
+                # Drop reference so we don't attempt to interact with it again
+                task.conversion_process = None
+                continue
+
+        if detached_count:
+            logger.info(
+                f"{detached_count} conversion(s) will finish in the background."
+            )
+        else:
+            logger.debug("No conversion processes needed detaching.")
+
+        return detached_count
+
     def _save_detached_process_data(self, task, pid):
         """Save information about a detached recording process.
 
@@ -1164,6 +1186,9 @@ class Supervisor:
 
         # Cancel dashboard and reload tasks
         await self._cancel_system_tasks()
+
+        # Always detach conversion processes so they can finish
+        self._detach_conversion_processes()
 
         # First identify all recording tasks
         recording_tasks = [task for task in self.tasks.values() if task.is_recording()]
@@ -1296,6 +1321,8 @@ class Supervisor:
                         colour, state = YELLOW, "LIVE"
                     else:
                         colour, state = YELLOW, "LIVE"
+                elif t.conversion_pending:
+                    colour, state = MAGENTA, "CONV"
                 else:
                     colour, state = RED, "OFF"
 

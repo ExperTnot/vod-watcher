@@ -5,7 +5,9 @@ utils.py — Utility functions for vod_watcher
 import asyncio
 import re
 import time
-from typing import Dict
+import datetime as dt
+import subprocess
+from typing import Dict, Optional
 from env import PROBE_INTERVAL, PLATFORM_COOLDOWN
 
 # Compile regex pattern for date detection
@@ -91,3 +93,39 @@ def strip_end_date_time(text: str) -> str:
     if len(parts) >= 2 and DATE_RE.fullmatch(parts[-2]):
         return " ".join(parts[:-2]).rstrip(" -_/")
     return text
+
+def log_new_line_file(path, message):
+    with open(path, "a+", encoding="utf-8") as lf:
+        lf.write(f"{dt.datetime.now().isoformat()} {message}\n")
+
+async def get_video_duration(filepath) -> Optional[float]:
+    """Get video duration in seconds using ffprobe.
+    
+    Returns:
+        Duration in seconds as float, or None if unable to determine.
+    """
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            str(filepath)
+        ]
+        
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        stdout, _ = await proc.communicate()
+        
+        if proc.returncode == 0:
+            duration_str = stdout.decode().strip()
+            if duration_str:
+                return float(duration_str)
+    except Exception:
+        pass
+    
+    return None
