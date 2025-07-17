@@ -1284,6 +1284,8 @@ class Supervisor:
         update_interval = 1.0 / DASH_FPS
         first_run = True
 
+        has_oauth = "YES" if bool(TWITCH_OAUTH_TOKEN.strip()) else "NO"
+
         while True:
             # Build all lines in a list before printing
             display_lines = []
@@ -1291,7 +1293,7 @@ class Supervisor:
 
             # Add header lines
             display_lines.append(
-                f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  -  VOD Watcher   (next reload in {reload_in}s)\n"
+                f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  -  VOD Watcher  (next reload in {reload_in}s)  Twitch OAuth: {has_oauth}\n"
             )
             display_lines.append(
                 f"{'Platform':8} {'Channel':20} {'Keyword':12} {'State':10} {'Next':6} Title"
