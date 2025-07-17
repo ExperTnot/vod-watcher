@@ -1,3 +1,5 @@
+> ⚠️ **Important Note About Twitch Recordings**: Without using an OAuth token, Twitch recordings may experience missing segments (typically a few minutes per hour, depending on ad frequency) due to ad breaks. This is expected behavior and cannot be fixed by this program. For the best recording quality, please see the [Optional Twitch OAuth Token](#optional-twitch-oauth-token-recommended) section below.
+
 # VOD Watcher
 
 A 24/7 YouTube & Twitch VOD recorder for Linux and Raspberry Pi.
@@ -11,7 +13,8 @@ Continuously monitors channels, applies keyword filters, and automatically recor
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Setup](#setup)
-- [Optional Discord Integration](#optional-discord-integration)
+- [Discord Integration (Optional)](#optional-discord-integration)
+- [Twitch OAuth Token (Optional)](#optional-twitch-oauth-token-recommended)
 - [Usage](#usage)
 - [Running in the Background with tmux (recommended)](#running-in-the-background-with-tmux-recommended)
 - [Log Files](#log-files)
@@ -125,6 +128,38 @@ For profile pictures in notifications:
 
 * **YouTube profile picture**: Get an API key from [Google Cloud Console](https://console.cloud.google.com/)
 * **Twitch profile picture**: Register an application on the [Twitch Developer Console](https://dev.twitch.tv/console)
+
+---
+
+## Optional Twitch OAuth Token (Recommended)
+
+To improve Twitch recording reliability and prevent ads from corrupting stream fragments, you can optionally configure a Twitch OAuth token. This helps prevent stream discontinuities caused by ads and reduces the likelihood of corrupted TS fragments.
+
+### How to Get Your Twitch OAuth Token
+
+1. **Log into Twitch** in your web browser
+2. **Subscribe to the streamer** you want to record
+3. **Open Developer Tools** (F12 or right-click → Inspect)
+4. **Go to the Console tab**
+5. **Run this JavaScript code** to extract your OAuth token:
+
+```javascript
+// You may need to enable copying and pasting to console in your browser
+document.cookie.split("; ").find(item=>item.startsWith("auth-token="))?.split("=")[1]
+```
+
+6. **Copy the token** that appears in the console without the quotations
+7. **Add it to your `env.py`** file:
+
+```python
+TWITCH_OAUTH_TOKEN = "your_oauth_token_here"
+```
+
+### Usage Notes
+
+- The OAuth token is **optional** but **recommended** for better Twitch recording reliability
+- You must be **subscribed to the streamer** for the token to provide ad-free viewing
+- Leave `TWITCH_OAUTH_TOKEN = ""` as if you don't have a token or don't want to use it
 
 ---
 

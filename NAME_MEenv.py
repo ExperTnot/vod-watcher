@@ -13,3 +13,7 @@ DISCORD_WEBHOOK_URL = ""  # Discord webhook URL for notifications (optional)
 YOUTUBE_API_KEY = ""      # YouTube API key for profile pictures (optional)
 TWITCH_CLIENT_ID = ""     # Twitch client ID for API access (required for Twitch profile pictures)
 TWITCH_CLIENT_SECRET = "" # Twitch client secret for API access (required for Twitch profile pictures)
+
+# Optional Twitch OAuth token for preventing stream discontinuities and ad-related corruption
+# See README.md for instructions on how to obtain this token
+TWITCH_OAUTH_TOKEN = ""   # Twitch OAuth token (optional, prevents ads and stream discontinuities)

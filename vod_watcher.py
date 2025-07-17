@@ -37,6 +37,7 @@ from env import (
     RELOAD_INTERVAL,
     PROBE_INTERVAL,
     PLATFORM_COOLDOWN,
+    TWITCH_OAUTH_TOKEN,
 )
 from api import send_discord_notification
 from verifications import verify_paths
@@ -65,7 +66,7 @@ PLATFORM_COOLDOWN = max(20, PLATFORM_COOLDOWN)
 MAX_YT_HEIGHT = 1080
 
 STREAMLINK_SEGMENT_ATTEMPTS = 10 # default is 3
-STREAMLINK_SEGMENT_TIMEOUT = 10 # default is 10
+STREAMLINK_SEGMENT_TIMEOUT = 30 # default is 10
 STREAMLINK_TIMEOUT = 120 # default is 60
 YTDLT_ATTEMPTS = 15
 
@@ -671,27 +672,21 @@ class ChannelTask:
         else:
             url = f"https://twitch.tv/{self.name}"
             cmd = [
-                "yt-dlp",
+                "streamlink",
                 url,
+                "best",
+                "--twitch-disable-ads",
+                "--twitch-disable-hosting",
                 "-o",
                 str(vod_fp),
-                "--retries", str(YTDLT_ATTEMPTS),
-                "--fragment-retries", "infinite",
-                "--concurrent-fragments", "5",
+                "--hls-segment-attempts", str(STREAMLINK_SEGMENT_ATTEMPTS),
+                "--hls-segment-timeout", str(STREAMLINK_SEGMENT_TIMEOUT),
+                "--hls-timeout", str(STREAMLINK_TIMEOUT),
             ]
-
-            # cmd = [
-            #     "streamlink",
-            #     url,
-            #     "best",
-            #     "--twitch-disable-hosting",
-            #     "--twitch-disable-ads",
-            #     "-o",
-            #     str(vod_fp),
-            #     "--stream-segment-attempts", str(STREAMLINK_SEGMENT_ATTEMPTS),
-            #     "--stream-segment-timeout", str(STREAMLINK_SEGMENT_TIMEOUT),
-            #     "--stream-timeout", str(STREAMLINK_TIMEOUT),
-            # ]
+            
+            # Add OAuth token if provided to prevent ads and stream discontinuities
+            if TWITCH_OAUTH_TOKEN:
+                cmd.extend(["--twitch-api-header", f"Authorization=OAuth {TWITCH_OAUTH_TOKEN}"])
 
         logger.info(f"START {self.platform}::{self.name} → {vod_fp.name}")
 
