@@ -441,7 +441,7 @@ class ChannelTask:
                     self.current_title = "<not live>"
 
                 if live and ok and not self.is_recording():
-                    await self._start_recording(self.current_title)
+                        await self._start_recording(self.current_title)
                 elif (
                     not live or not ok
                 ) and self.is_recording():  # Stream ended or keyword no longer matches
@@ -687,11 +687,11 @@ class ChannelTask:
                 "--twitch-disable-hosting",
                 "-o",
                 str(vod_fp),
-                "--hls-segment-attempts",
+                "--stream-segment-attempts",
                 str(STREAMLINK_SEGMENT_ATTEMPTS),
-                "--hls-segment-timeout",
+                "--stream-segment-timeout",
                 str(STREAMLINK_SEGMENT_TIMEOUT),
-                "--hls-timeout",
+                "--stream-timeout",
                 str(STREAMLINK_TIMEOUT),
             ]
 
@@ -732,13 +732,13 @@ class ChannelTask:
                     pass
                 self.log_file_handle = None
 
-        self.proc = subprocess.Popen(
-            cmd,
-            stdout=self.log_file_handle if self.log_file_handle else subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            text=False,
-            preexec_fn=os.setsid,
-        )
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=self.log_file_handle if self.log_file_handle else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                text=False,
+                preexec_fn=os.setsid,
+            )
 
     async def _stop_recording(self, reason: str = "Unknown reason"):
         """Stop an active recording process.
