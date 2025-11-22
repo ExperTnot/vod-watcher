@@ -4,12 +4,12 @@ api.py — External API functions for vod_watcher
 
 import datetime as dt
 import logging
+import time
 from typing import Optional
 
 import aiohttp
 
-# Import configuration variables from env.py
-from env import (
+from globals import (
     DISCORD_WEBHOOK_URL,
     YOUTUBE_API_KEY,
     TWITCH_CLIENT_ID,
@@ -19,12 +19,16 @@ from env import (
 # Setup logging
 logger = logging.getLogger("vod_watcher")
 
+# Simple cache for Twitch token
+_twitch_token_cache = {"token": None, "expires_at": 0}
+
 
 async def get_twitch_access_token() -> Optional[str]:
     """Obtain an OAuth access token for the Twitch API.
 
     Uses client credentials flow to authenticate with Twitch servers.
     Requires TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET to be set.
+    Caches the token until it expires (defaulting to 1 hour if not specified).
 
     Returns:
         str or None: The OAuth access token if successful, None otherwise
@@ -37,6 +41,11 @@ async def get_twitch_access_token() -> Optional[str]:
     ):
         logger.debug("Twitch client credentials not set, skipping thumbnail fetch.")
         return None
+
+    # Check cache
+    now = time.time()
+    if _twitch_token_cache["token"] and now < _twitch_token_cache["expires_at"]:
+        return _twitch_token_cache["token"]
 
     try:
         params = {
@@ -51,7 +60,14 @@ async def get_twitch_access_token() -> Optional[str]:
             ) as response:
                 if response.status == 200:
                     data = await response.json()
-                    return data.get("access_token")
+                    token = data.get("access_token")
+                    expires_in = data.get("expires_in", 3600)
+
+                    # Update cache
+                    _twitch_token_cache["token"] = token
+                    _twitch_token_cache["expires_at"] = now + expires_in - 60  # Buffer
+
+                    return token
                 else:
                     logger.warning(
                         f"Failed to get Twitch access token: {response.status}"
@@ -63,22 +79,12 @@ async def get_twitch_access_token() -> Optional[str]:
 
 
 async def get_twitch_channel_thumbnail(channel_name: str) -> Optional[str]:
-    """Fetch a Twitch channel's profile image URL.
-
-    Uses the Twitch Helix API to retrieve user profile data for the given channel.
-
-    Args:
-        channel_name: The Twitch channel login name to fetch thumbnail for
-
-    Returns:
-        str or None: URL to the channel's profile image if successful, None otherwise
-    """
+    """Fetch a Twitch channel's profile image URL."""
     access_token = await get_twitch_access_token()
     if not access_token:
         return None
 
     headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {access_token}"}
-
     params = {"login": channel_name}
 
     try:
@@ -100,23 +106,12 @@ async def get_twitch_channel_thumbnail(channel_name: str) -> Optional[str]:
 
 
 async def get_youtube_channel_thumbnail(channel_name: str) -> Optional[str]:
-    """Fetch a YouTube channel's thumbnail URL.
-
-    Uses the YouTube Data API v3 to retrieve the channel's thumbnail.
-    Requires YOUTUBE_API_KEY to be set.
-
-    Args:
-        channel_name: The YouTube channel name or handle to fetch thumbnail for
-
-    Returns:
-        str or None: URL to the channel's thumbnail image if successful, None otherwise
-    """
+    """Fetch a YouTube channel's thumbnail URL."""
     if not YOUTUBE_API_KEY or YOUTUBE_API_KEY.strip() == "":
         logger.debug("YouTube API key not set, skipping thumbnail fetch.")
         return None
 
     username = channel_name[1:] if channel_name.startswith("@") else channel_name
-
     params = {"part": "snippet", "forHandle": username, "key": YOUTUBE_API_KEY}
 
     try:
@@ -146,16 +141,7 @@ async def get_youtube_channel_thumbnail(channel_name: str) -> Optional[str]:
 
 
 async def send_discord_notification(platform: str, channel_name: str, title: str):
-    """Send a Discord webhook notification when a stream recording starts.
-
-    Creates a rich embed with the channel name, stream title, platform, timestamp,
-    and channel profile image (if available).
-
-    Args:
-        platform: The platform name
-        channel_name: The channel name that is being recorded
-        title: The title of the stream being recorded
-    """
+    """Send a Discord webhook notification when a stream recording starts."""
     logger.info(f"Recording started: {platform.capitalize()}/{channel_name} - {title}")
 
     if not DISCORD_WEBHOOK_URL:
@@ -178,12 +164,8 @@ async def send_discord_notification(platform: str, channel_name: str, title: str
     thumbnail_url = None
     if platform.lower() == "youtube":
         thumbnail_url = await get_youtube_channel_thumbnail(channel_name)
-        if thumbnail_url:
-            logger.debug(f"Added thumbnail for YouTube channel {channel_name}")
     elif platform.lower() == "twitch":
         thumbnail_url = await get_twitch_channel_thumbnail(channel_name)
-        if thumbnail_url:
-            logger.debug(f"Added thumbnail for Twitch channel {channel_name}")
 
     if thumbnail_url:
         embed["thumbnail"] = {"url": thumbnail_url}

@@ -1,5 +1,3 @@
-> ⚠️ **Important Note About Twitch Recordings**: Without using an OAuth token, Twitch recordings may experience missing segments (typically a few minutes per hour, depending on ad frequency) due to ad breaks. This is expected behavior and cannot be fixed by this program. For the best recording quality, please see the [Optional Twitch OAuth Token](#optional-twitch-oauth-token-recommended) section below.
-
 # VOD Watcher
 
 A 24/7 YouTube & Twitch VOD recorder for Linux and Raspberry Pi.
@@ -96,6 +94,9 @@ Continuously monitors channels, applies keyword filters, and automatically recor
    YOUTUBE_API_KEY = ""     # For YouTube channel profile pictures
    TWITCH_CLIENT_ID = ""    # For Twitch channel profile pictures
    TWITCH_CLIENT_SECRET = "" # For Twitch channel profile pictures
+
+   # Optional Twitch OAuth token for preventing stream discontinuities and ad-related corruption
+   TWITCH_OAUTH_TOKEN = ""   # Twitch OAuth token (optional, prevents ads and stream discontinuities)
    ```
 
 3. **Configure channels**:
@@ -165,6 +166,7 @@ TWITCH_OAUTH_TOKEN = "your_oauth_token_here"
 
 ## Usage
 
+Run the main script:
 ```bash
 python3 vod_watcher.py
 ```

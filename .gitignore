@@ -14,3 +14,4 @@ logs/*
 .detached.json
 env.py
 .vscode/
+test/

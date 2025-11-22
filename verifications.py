@@ -7,18 +7,19 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
-from env import VOD_ROOT, LOG_ROOT
+from globals import (
+    CHECK_FILE,
+    DETACHED_FILE,
+    LOG_DIR,
+    LOG_ROOT,
+    SCRIPT_DIR,
+    VOD_ROOT,
+    RED,
+    RESET,
+)
 
 # Setup logger
 logger = logging.getLogger("vod_watcher")
-
-# Define paths
-SCRIPT_DIR = Path(__file__).parent.resolve()
-CHECK_FILE = SCRIPT_DIR / "checkme.txt"
-LOG_DIR = SCRIPT_DIR / "logs"
-DETACHED_FILE = SCRIPT_DIR / ".detached.json"
-VOD_ROOT = Path(VOD_ROOT)
-LOG_ROOT = Path(LOG_ROOT)
 
 
 def _verify_ffmpeg():
@@ -120,18 +121,15 @@ def _verify_files():
         bool: True if all file checks pass, False otherwise
     """
     if not CHECK_FILE.exists():
-        try:
-            example_content = (
-                "# Format: platform,channel,keyword\n"
-                "# Example:\n"
-                "# youtube,@channelname,keyword\n"
-                "# twitch,channelname,keyword\n"
-            )
-            CHECK_FILE.write_text(example_content)
-            logger.info(f"Created example configuration at {CHECK_FILE}")
-        except (PermissionError, OSError) as e:
-            logger.error(f"Cannot create configuration file at {CHECK_FILE}: {e}")
-            return False
+        error_msg1 = f"Configuration file not found at {CHECK_FILE}"
+        error_msg2 = (
+            "Please copy 'checkme.txt.example' to 'checkme.txt' and add your channels."
+        )
+        print(f"{RED}{error_msg1}{RESET}")
+        print(error_msg2)
+        logger.error(error_msg1)
+        logger.error(error_msg2)
+        return False
 
     try:
         CHECK_FILE.read_text()
