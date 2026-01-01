@@ -167,6 +167,7 @@ class Recorder(ABC):
             try:
                 await asyncio.wait_for(asyncio.to_thread(self.proc.wait), timeout=10)
             except asyncio.TimeoutError:
+                logger.warning(f"Process {process_id} did not terminate gracefully within 10s, killing")
                 self.proc.kill()
                 await asyncio.to_thread(self.proc.wait)
         except Exception as e:
@@ -174,12 +175,7 @@ class Recorder(ABC):
 
         self.proc = None
 
-        # Trigger post-processing if needed
-        if (
-            self.platform == "twitch"
-            and self.current_vod_fp
-            and self.current_vod_fp.exists()
-        ):
+        if self.platform == "twitch" and self.current_vod_fp and self.current_vod_fp.exists():
             asyncio.create_task(self._convert_ts_to_mp4())
 
     @abstractmethod
@@ -214,32 +210,32 @@ class YouTubeRecorder(Recorder):
         ]
 
     def cleanup_partials(self):
-        """Clean up yt-dlp temporary files."""
-        super().cleanup_partials()
-
+        """Clean up yt-dlp temporary files. Only deletes if final file is missing."""
         if not self.current_vod_fp:
             return
 
-        # yt-dlp creates files like:
-        # base.f137.mp4.part
-        # base.f137.mp4.ytdl
-        # base.f140.mp4.part-Frag123
-        # where "base" is the filename without extension
-
-        base_stem = self.current_vod_fp.stem  # filename without .mp4
-        parent_dir = self.current_vod_fp.parent
+        final_fp = self.current_vod_fp
+        base_stem = final_fp.stem
+        parent_dir = final_fp.parent
 
         if not parent_dir.exists():
             return
+
+        if final_fp.exists() and final_fp.stat().st_size > 0:
+            logger.debug(f"Final file {final_fp.name} exists, skipping cleanup of partials")
+            return
+
+        logger.info(f"Cleaning up partial YouTube VOD files for {base_stem}")
 
         for item in parent_dir.iterdir():
             if not item.is_file():
                 continue
 
-            # Check if file starts with the base stem (without extension)
-            # This catches files like "base.f137.mp4.part" and "base.f140.mp4.ytdl"
             if item.name.startswith(base_stem):
-                if ".part" in item.name or item.name.endswith(".ytdl"):
+                if (".part" in item.name or
+                    item.name.endswith(".ytdl") or
+                    item.name.endswith(".temp.mp4") or
+                    "-Frag" in item.name):
                     try:
                         item.unlink()
                         logger.info(f"Deleted partial artifact {item.name}")

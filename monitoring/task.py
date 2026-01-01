@@ -3,6 +3,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +37,10 @@ class ChannelTask:
         self.live_raw: bool = False
         self.keyword_ok: bool = False
         self.next_probe: float = 0.0
+
+        # Orphan detection state - let recorders detect stream end naturally
+        self.offline_detected_at: Optional[float] = None
+        self.MAX_OFFLINE_WAIT = 1800  # 30 minutes max to wait after offline detection
 
         # Detached process state
         self.detached_pid: Optional[int] = None
@@ -194,18 +199,24 @@ class ChannelTask:
                         self.current_title = title
                     elif not self.current_title:
                         self.current_title = "<title unavailable>"
+                    # Reset offline detection when stream is live again
+                    self.offline_detected_at = None
                 else:
                     self.current_title = "<not live>"
 
                 if live and ok and not self.is_recording():
                     await self.recorder.start(self.current_title)
-                elif (not live or not ok) and self.is_recording():
-                    reason = (
-                        "Stream went offline"
-                        if not live
-                        else "Keyword no longer matched"
+                elif not live and self.is_recording() and self.offline_detected_at is None:
+                    # Stream went offline - let recorder detect actual stream end
+                    # Don't terminate immediately, let yt-dlp/streamlink exit naturally
+                    self.offline_detected_at = time.time()
+                    logger.info(
+                        f"Stream offline detected for {self.platform}::{self.name}, "
+                        f"letting recorder drain naturally"
                     )
-                    await self.recorder.stop(reason=reason)
+
+                # Check for orphaned recordings - only terminate if running too long
+                await self._check_orphaned_recording()
 
                 # Logging titles
                 if (
@@ -215,8 +226,7 @@ class ChannelTask:
                 ):
                     logdir = LOG_ROOT / self.name
                     logdir.mkdir(parents=True, exist_ok=True)
-                    now = os.path.getmtime(logdir)  # Just using a timestamp
-                    # Actually use datetime
+                    now = os.path.getmtime(logdir)
                     import datetime as dt
 
                     now_str = dt.datetime.now().isoformat()
@@ -232,3 +242,20 @@ class ChannelTask:
                 logger.exception(f"{self.platform}::{self.name} probe failure")
 
             await asyncio.sleep(interval)
+
+    async def _check_orphaned_recording(self):
+        """Check for recordings running too long after offline detection."""
+        if (
+            self.offline_detected_at is None
+            or not self.is_recording()
+        ):
+            return
+
+        time_since_offline = time.time() - self.offline_detected_at
+        if time_since_offline > self.MAX_OFFLINE_WAIT:
+            logger.warning(
+                f"Recording still running {int(time_since_offline)}s after offline detection, "
+                f"terminating orphaned process for {self.platform}::{self.name}"
+            )
+            await self.recorder.stop(reason="Orphaned recording")
+            self.offline_detected_at = None
